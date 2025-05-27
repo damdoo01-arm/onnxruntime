@@ -266,19 +266,9 @@ function(setup_mlas_source_for_windows)
 endfunction()
 
 function(setup_kleidiai)
-  target_compile_definitions(onnxruntime_mlas PRIVATE USE_KLEIDIAI)
-
-  # Disable the KleidiAI tests
-  set(KLEIDIAI_BUILD_TESTS  OFF)
-
-  # Fetch KleidiAI sources:
-  if (NOT TARGET kleidiai)
-    onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
-  endif()
-  onnxruntime_fetchcontent_makeavailable(kleidiai)
-
   target_sources(onnxruntime_mlas PRIVATE
     ${MLAS_SRC_DIR}/kai_ukernel_interface.cpp
+    ${MLAS_SRC_DIR}/kleidiai/sgemm_kleidiai.cpp
   )
   target_link_libraries(onnxruntime_mlas PRIVATE kleidiai)
 endfunction()
