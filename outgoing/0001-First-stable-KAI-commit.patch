@@ -1,0 +1,925 @@
+From 248bd7b2ad2397c64fc557b68c1a6bd8ed521f10 Mon Sep 17 00:00:00 2001
+From: Damien Dooley <damien.dooley@arm.com>
+Date: Tue, 27 May 2025 21:41:02 +0100
+Subject: [HIGH RISK] First stable KAI commit
+To: onnxruntime-patches@listhost.cambridge.arm.com
+
+---
+ cmake/CMakeLists.txt                          |   5 +
+ .../external/onnxruntime_external_deps.cmake  |   8 +
+ cmake/onnxruntime_mlas.cmake                  |  12 +-
+ onnxruntime/core/common/cpuid_info.cc         |   2 +
+ onnxruntime/core/common/cpuid_info.h          |   2 +
+ .../core/mlas/lib/kleidiAI/mlasi_kleidiai.h   |  83 +++++
+ .../core/mlas/lib/kleidiAI/sgemm_kleidiai.cpp | 304 ++++++++++++++++++
+ onnxruntime/core/mlas/lib/mlasi_kleidiai.h    |  83 +++++
+ onnxruntime/core/mlas/lib/sgemm_kleidiai.cpp  | 304 ++++++++++++++++++
+ 9 files changed, 792 insertions(+), 11 deletions(-)
+ create mode 100644 onnxruntime/core/mlas/lib/kleidiAI/mlasi_kleidiai.h
+ create mode 100644 onnxruntime/core/mlas/lib/kleidiAI/sgemm_kleidiai.cpp
+ create mode 100644 onnxruntime/core/mlas/lib/mlasi_kleidiai.h
+ create mode 100644 onnxruntime/core/mlas/lib/sgemm_kleidiai.cpp
+
+diff --git a/cmake/CMakeLists.txt b/cmake/CMakeLists.txt
+index 08aed0cb2..49bf313da 100644
+--- a/cmake/CMakeLists.txt
++++ b/cmake/CMakeLists.txt
+@@ -1195,6 +1195,11 @@ function(onnxruntime_set_compile_flags target_name)
+       target_compile_definitions(${target_name} PRIVATE ENABLE_ATEN)
+     endif()
+ 
++    if (onnxruntime_USE_KLEIDIAI)
++      target_compile_definitions(${target_name} PRIVATE USE_KLEIDIAI)
++    endif()
++
++
+     set_target_properties(${target_name} PROPERTIES COMPILE_WARNING_AS_ERROR ON)
+     if (onnxruntime_USE_CUDA)
+       # Suppress a "conversion_function_not_usable" warning in gsl/span
+diff --git a/cmake/external/onnxruntime_external_deps.cmake b/cmake/external/onnxruntime_external_deps.cmake
+index e2b0432f3..3f27dc421 100644
+--- a/cmake/external/onnxruntime_external_deps.cmake
++++ b/cmake/external/onnxruntime_external_deps.cmake
+@@ -803,6 +803,14 @@ if(onnxruntime_USE_COREML)
+ 
+ endif()
+ 
++if(onnxruntime_USE_KLEIDIAI)
++  # Disable the KleidiAI tests
++  set(KLEIDIAI_BUILD_TESTS  OFF)
++
++  onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
++  onnxruntime_fetchcontent_makeavailable(kleidiai)
++endif()
++
+ set(onnxruntime_LINK_DIRS)
+ if (onnxruntime_USE_CUDA)
+   find_package(CUDAToolkit REQUIRED)
+diff --git a/cmake/onnxruntime_mlas.cmake b/cmake/onnxruntime_mlas.cmake
+index 3279a17f8..cc44fa377 100644
+--- a/cmake/onnxruntime_mlas.cmake
++++ b/cmake/onnxruntime_mlas.cmake
+@@ -266,19 +266,9 @@ function(setup_mlas_source_for_windows)
+ endfunction()
+ 
+ function(setup_kleidiai)
+-  target_compile_definitions(onnxruntime_mlas PRIVATE USE_KLEIDIAI)
+-
+-  # Disable the KleidiAI tests
+-  set(KLEIDIAI_BUILD_TESTS  OFF)
+-
+-  # Fetch KleidiAI sources:
+-  if (NOT TARGET kleidiai)
+-    onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
+-  endif()
+-  onnxruntime_fetchcontent_makeavailable(kleidiai)
+-
+   target_sources(onnxruntime_mlas PRIVATE
+     ${MLAS_SRC_DIR}/kai_ukernel_interface.cpp
++    ${MLAS_SRC_DIR}/kleidiai/sgemm_kleidiai.cpp
+   )
+   target_link_libraries(onnxruntime_mlas PRIVATE kleidiai)
+ endfunction()
+diff --git a/onnxruntime/core/common/cpuid_info.cc b/onnxruntime/core/common/cpuid_info.cc
+index 91961bf22..cabf51ba6 100644
+--- a/onnxruntime/core/common/cpuid_info.cc
++++ b/onnxruntime/core/common/cpuid_info.cc
+@@ -174,6 +174,7 @@ void CPUIDInfo::ArmLinuxInit() {
+     has_arm_neon_i8mm_ = cpuinfo_has_arm_i8mm();
+     has_arm_sve_i8mm_ = cpuinfo_has_arm_sve() && cpuinfo_has_arm_i8mm();
+     has_arm_neon_bf16_ = cpuinfo_has_arm_neon_bf16();
++    has_arm_sme_ = cpuinfo_has_arm_sme();
+ 
+     const uint32_t core_cnt = cpuinfo_get_cores_count();
+     core_uarchs_.resize(core_cnt, cpuinfo_uarch_unknown);
+@@ -326,6 +327,7 @@ void CPUIDInfo::ArmAppleInit() {
+     has_arm_neon_i8mm_ = cpuinfo_has_arm_i8mm();
+     has_arm_sve_i8mm_ = cpuinfo_has_arm_sve() && cpuinfo_has_arm_i8mm();
+     has_arm_neon_bf16_ = cpuinfo_has_arm_neon_bf16();
++    has_arm_sme_ = cpuinfo_has_arm_sme();
+ 
+     // Note: We leave is_armv8_narrow_ld_ unset because it only applies to a limited set of uarchs that we don't expect
+     // to encounter on Apple platforms.
+diff --git a/onnxruntime/core/common/cpuid_info.h b/onnxruntime/core/common/cpuid_info.h
+index b820fa2ab..6b997cfdf 100644
+--- a/onnxruntime/core/common/cpuid_info.h
++++ b/onnxruntime/core/common/cpuid_info.h
+@@ -39,6 +39,7 @@ class CPUIDInfo {
+   bool HasArmNeon_I8MM() const { return has_arm_neon_i8mm_; }
+   bool HasArmSVE_I8MM() const { return has_arm_sve_i8mm_; }
+   bool HasArmNeon_BF16() const { return has_arm_neon_bf16_; }
++  bool HasArm_SME() const { return has_arm_sme_; }
+ 
+   uint32_t GetCurrentCoreIdx() const;
+ 
+@@ -125,6 +126,7 @@ class CPUIDInfo {
+   bool has_arm_neon_i8mm_{false};
+   bool has_arm_sve_i8mm_{false};
+   bool has_arm_neon_bf16_{false};
++  bool has_arm_sme_{false};
+ 
+   std::string vendor_;
+   uint32_t vendor_id_;
+diff --git a/onnxruntime/core/mlas/lib/kleidiAI/mlasi_kleidiai.h b/onnxruntime/core/mlas/lib/kleidiAI/mlasi_kleidiai.h
+new file mode 100644
+index 000000000..094435603
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/kleidiAI/mlasi_kleidiai.h
+@@ -0,0 +1,83 @@
++/*++
++
++Copyright (c) Microsoft Corporation.  All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    mlasi.h
++
++Abstract:
++
++    This module contains the private data structures and procedure prototypes
++    for the ARM KleidiAI implementation of the Microsoft Machine Learning algebra subprogram library.
++
++--*/
++
++#pragma once
++
++#include "mlasi.h"
++
++namespace ARMKleidiAI {
++
++class NotSupported : public std::exception{};
++
++#if defined(USE_KLEIDIAI) && !defined(_MSVC_LANG)
++
++#define kai_check_if_supported(check)            \
++    do {                                         \
++        try {                                    \
++            check;                               \
++        } catch (ARMKleidiAI::NotSupported) {    \
++            /*intentionally fall through and     \
++              fallback*/                         \
++            /*Gather usage stats for integration \
++              coverage*/                         \
++        }                                        \
++    }                                            \
++    while (0)
++#else
++
++#define kai_check_if_supported(check)
++
++#endif
++
++//
++// Buffer packing routines.
++//
++
++size_t
++MLASCALL
++MlasGemmPackBSize(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K
++    );
++
++void
++MLASCALL
++MlasGemmPackB(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K,
++    const float* B,
++    size_t ldb,
++    void* PackedB
++    );
++
++void
++MLASCALL
++MlasGemmBatch(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t M,
++    size_t N,
++    size_t K,
++    const MLAS_SGEMM_DATA_PARAMS* Data,
++    size_t BatchSize,
++    MLAS_THREADPOOL* ThreadPool
++    );
++}
+\ No newline at end of file
+diff --git a/onnxruntime/core/mlas/lib/kleidiAI/sgemm_kleidiai.cpp b/onnxruntime/core/mlas/lib/kleidiAI/sgemm_kleidiai.cpp
+new file mode 100644
+index 000000000..79072db08
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/kleidiAI/sgemm_kleidiai.cpp
+@@ -0,0 +1,304 @@
++/*++
++
++Copyright (c) Microsoft Corporation. All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    sgemm_kleidiai.cpp
++
++Abstract:
++
++    This module implements the KleidiAI single precision matrix/matrix multiply
++    operation (SGEMM).
++
++--*/
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p16vlx1b_1x16vl_sme2_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p8x1biasf32_6x8x4_neon_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa.h"
++#include "kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme.h"
++#include "kai/ukernels/matmul/pack/kai_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme.h"
++#include "kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme.h"
++#include "mlasi_kleidiai.h"
++
++
++size_t
++MLASCALL
++ARMKleidiAI::MlasGemmPackBSize(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K
++    )
++/*++
++
++Routine Description:
++
++    This routine computes the length in bytes for the packed matrix B buffer.
++
++Arguments:
++
++    TransA - Supplies the transpose operation on A matrix
++
++    TransB - Supplies the transpose operation on B matrix
++
++    N - Supplies the number of columns of matrix B.
++
++    K - Supplies the number of rows of matrix B.
++
++Return Value:
++
++    Returns the size in bytes for the packed matrix B buffer.
++
++--*/
++{
++    //
++    // Compute the number of bytes required to hold the packed buffer.
++    //
++    size_t bytes = 0;
++
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++        switch (TransB) {
++            case CblasNoTrans:
++                bytes = kai_get_rhs_packed_size_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme(N, K);
++                break;
++            case CblasTrans:
++                bytes = kai_get_rhs_packed_size_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(N, K);
++                break;
++            default:
++                throw ARMKleidiAI::NotSupported();
++                break;
++        }
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++
++    return bytes;
++}
++
++void
++MLASCALL
++ARMKleidiAI::MlasGemmPackB(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K,
++    const float* B,
++    size_t ldb,
++    void* PackedB
++    )
++/*++
++
++Routine Description:
++
++    This routine packs the contents of matrix B to the destination buffer. The
++    destination buffer should be sized based on MlasGemmPackBSize(). For best
++    performance, the destination buffer should be aligned to the value returned
++    from MlasGetPreferredBufferAlignment().
++
++Arguments:
++
++    TransA - Supplies the transpose operation for matrix A.
++
++    TransB - Supplies the transpose operation for matrix B.
++
++    N - Supplies the number of columns of matrix B.
++
++    K - Supplies the number of rows of matrix B.
++
++    B - Supplies the address of matrix B.
++
++    ldb - Supplies the first dimension of matrix B.
++
++    PackedB - Supplies the address of packed matrix B.
++
++Return Value:
++
++    None.
++
++--*/
++{
++    MLAS_UNREFERENCED_PARAMETER(TransA);
++
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++
++        const size_t nr = kai_get_nr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t kr = kai_get_kr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t sr = kai_get_sr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        //pass zeroed bias values
++        const std::vector<float> bias(N);
++
++        switch (TransB) {
++            case CblasNoTrans:
++                kai_run_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme(1, N, K, nr, kr, sr,
++                                                                ldb*sizeof(float),
++                                                                B,
++                                                                bias.data(), nullptr,
++                                                                PackedB, 0, nullptr);
++                break;
++            case CblasTrans:
++                kai_run_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(1, N, K, nr, kr, sr,
++                                                                ldb*sizeof(float),
++                                                                B,
++                                                                bias.data(), nullptr,
++                                                                PackedB, 0, nullptr);
++                break;
++            default:
++                throw ARMKleidiAI::NotSupported();
++                break;
++        }
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++}
++
++void
++MLASCALL
++ARMKleidiAI::MlasGemmBatch(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t M,
++    size_t N,
++    size_t K,
++    const MLAS_SGEMM_DATA_PARAMS* Data,
++    size_t BatchSize,
++    MLAS_THREADPOOL* ThreadPool
++    )
++{
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++
++        const size_t mr = kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t kr = kai_get_kr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t sr = kai_get_sr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        auto m_step = kai_get_m_step_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        auto n_step = kai_get_n_step_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        std::vector<MLAS_SGEMM_DATA_PARAMS> KaiPackedData;
++        KaiPackedData.resize(BatchSize);
++
++        size_t LhsPackedStride = 0;
++        std::byte* LhsPackedData = nullptr;
++
++        LhsPackedStride = kai_get_lhs_packed_size_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr);
++        auto LhsPacked = std::make_unique<std::byte[]>(LhsPackedStride * BatchSize);
++        LhsPackedData = LhsPacked.get();
++
++        std::unique_ptr<std::byte[]> RhsPacked{nullptr};
++
++        // It is assumed all B batches require packing or not
++        if (Data[0].BIsPacked) {
++            //We have already decided the matmul variant we are using, before having values for M,N,K
++            MlasTrySimpleParallel(ThreadPool, BatchSize, [&](ptrdiff_t batch_idx) {
++                std::byte *LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
++
++                kai_run_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr, 0,
++                    Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
++
++                KaiPackedData[batch_idx].A = reinterpret_cast<const float*>(LhsPackedPtr);
++                KaiPackedData[batch_idx].B = Data[batch_idx].B;
++            });
++        } else {
++
++            //Multithread pack lhs and rhs
++            size_t RhsPackedStride = 0;
++            std::byte* RhsPackedData = nullptr;
++
++            RhsPackedStride = ARMKleidiAI::MlasGemmPackBSize(TransA, TransB, N, K);
++            RhsPacked = std::make_unique<std::byte[]>(RhsPackedStride * BatchSize);
++            RhsPackedData = RhsPacked.get();
++
++            MlasTrySimpleParallel(ThreadPool, BatchSize*2, [&](ptrdiff_t batch_idx) {
++                //lhs odd, rhs even
++                if (batch_idx & 0x1) {
++                    batch_idx >>= 1;
++
++                    std::byte *LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
++
++                    kai_run_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr, 0,
++                        Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
++
++                    KaiPackedData[batch_idx].A = reinterpret_cast<const float*>(LhsPackedPtr);
++                } else {
++                    batch_idx >>= 1;
++
++                    std::byte *RhsPackedPtr = &(RhsPackedData[RhsPackedStride * batch_idx]);
++
++                    ARMKleidiAI::MlasGemmPackB(TransA, TransB, N, K, reinterpret_cast<const float*>(Data[batch_idx].B),
++                                               Data[batch_idx].ldb, RhsPackedPtr);
++
++                    KaiPackedData[batch_idx].B = reinterpret_cast<const float*>(RhsPackedPtr);
++                }
++            });
++        }
++
++        //tile iteration dimensions
++        std::array<size_t,3> dim;
++        dim[0] = BatchSize;                 // B
++        dim[1] = MlasDivRoundup(M, m_step); // M
++        dim[2] = MlasDivRoundup(N, n_step); // N
++
++        //Minimize the kernel call count for the number of available threads
++        auto RequiredTiles = std::min(static_cast<size_t>(MlasGetMaximumThreadCount(ThreadPool)), dim[0]*dim[1]*dim[2]);
++
++        //scale required tiles over available tile processors
++        dim[1] = MlasDivRoundup(RequiredTiles * dim[1], dim[1] + dim[2]);
++        dim[2] = MlasDivRoundup(RequiredTiles * dim[2], dim[1] + dim[2]);
++
++        //compute new step sizes
++        m_step *= MlasDivRoundup(MlasDivRoundup(M, dim[1]), m_step);
++        n_step *= MlasDivRoundup(MlasDivRoundup(N, dim[2]), n_step);
++
++        //update tile iterations
++        dim[1] = MlasDivRoundup(M, m_step);
++        dim[2] = MlasDivRoundup(N, n_step);
++
++        MlasTrySimpleParallel(ThreadPool,
++            static_cast<ptrdiff_t>(dim[0]*dim[1]*dim[2]),
++            [=](ptrdiff_t tid)
++        {
++            //compute B,M,N index from iteration index
++            ptrdiff_t BIdx = tid / (dim[1] * dim[2]);
++            ptrdiff_t MIdx = (tid % (dim[1] * dim[2])) / dim[2];
++            ptrdiff_t NIdx = (tid % (dim[1] * dim[2])) % dim[2];
++
++            //Get rhs tile, B
++            const size_t rhs_packed_offset =
++                kai_get_rhs_packed_offset_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(NIdx*n_step, K);
++
++            auto BTile = reinterpret_cast<const void*>(
++                reinterpret_cast<const std::byte*>(KaiPackedData[BIdx].B) + rhs_packed_offset);
++
++            // Get lhs tile, A
++            const size_t lhs_packed_offset =
++                kai_get_lhs_packed_offset_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(MIdx*m_step, K);
++
++            auto ATile = reinterpret_cast<const float*>(
++                reinterpret_cast<const std::byte*>(KaiPackedData[BIdx].A) + lhs_packed_offset);
++
++            auto TileSizeM = (MIdx+1)*m_step > M ? (M - MIdx*m_step) : m_step;
++            auto TileSizeN = (NIdx+1)*n_step > N ? (N - NIdx*n_step) : n_step;
++
++            //Get result tile, C
++            auto CTile = reinterpret_cast<void*>(
++                reinterpret_cast<std::byte*>(Data[BIdx].C) +
++                MIdx * m_step * Data[BIdx].ldc * sizeof(float) +
++                NIdx * n_step * sizeof(float)
++            );
++
++            kai_run_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(
++                TileSizeM,
++                TileSizeN,
++                K,
++                ATile, BTile, CTile,
++                Data[BIdx].ldc * sizeof(float), sizeof(float),
++                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
++        });
++
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++}
+diff --git a/onnxruntime/core/mlas/lib/mlasi_kleidiai.h b/onnxruntime/core/mlas/lib/mlasi_kleidiai.h
+new file mode 100644
+index 000000000..094435603
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/mlasi_kleidiai.h
+@@ -0,0 +1,83 @@
++/*++
++
++Copyright (c) Microsoft Corporation.  All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    mlasi.h
++
++Abstract:
++
++    This module contains the private data structures and procedure prototypes
++    for the ARM KleidiAI implementation of the Microsoft Machine Learning algebra subprogram library.
++
++--*/
++
++#pragma once
++
++#include "mlasi.h"
++
++namespace ARMKleidiAI {
++
++class NotSupported : public std::exception{};
++
++#if defined(USE_KLEIDIAI) && !defined(_MSVC_LANG)
++
++#define kai_check_if_supported(check)            \
++    do {                                         \
++        try {                                    \
++            check;                               \
++        } catch (ARMKleidiAI::NotSupported) {    \
++            /*intentionally fall through and     \
++              fallback*/                         \
++            /*Gather usage stats for integration \
++              coverage*/                         \
++        }                                        \
++    }                                            \
++    while (0)
++#else
++
++#define kai_check_if_supported(check)
++
++#endif
++
++//
++// Buffer packing routines.
++//
++
++size_t
++MLASCALL
++MlasGemmPackBSize(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K
++    );
++
++void
++MLASCALL
++MlasGemmPackB(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K,
++    const float* B,
++    size_t ldb,
++    void* PackedB
++    );
++
++void
++MLASCALL
++MlasGemmBatch(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t M,
++    size_t N,
++    size_t K,
++    const MLAS_SGEMM_DATA_PARAMS* Data,
++    size_t BatchSize,
++    MLAS_THREADPOOL* ThreadPool
++    );
++}
+\ No newline at end of file
+diff --git a/onnxruntime/core/mlas/lib/sgemm_kleidiai.cpp b/onnxruntime/core/mlas/lib/sgemm_kleidiai.cpp
+new file mode 100644
+index 000000000..79072db08
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/sgemm_kleidiai.cpp
+@@ -0,0 +1,304 @@
++/*++
++
++Copyright (c) Microsoft Corporation. All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    sgemm_kleidiai.cpp
++
++Abstract:
++
++    This module implements the KleidiAI single precision matrix/matrix multiply
++    operation (SGEMM).
++
++--*/
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p16vlx1b_1x16vl_sme2_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p8x1biasf32_6x8x4_neon_mla.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa.h"
++#include "kai/ukernels/matmul/pack/kai_lhs_pack_f32p2vlx1_f32_sme.h"
++#include "kai/ukernels/matmul/pack/kai_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme.h"
++#include "kai/ukernels/matmul/pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme.h"
++#include "mlasi_kleidiai.h"
++
++
++size_t
++MLASCALL
++ARMKleidiAI::MlasGemmPackBSize(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K
++    )
++/*++
++
++Routine Description:
++
++    This routine computes the length in bytes for the packed matrix B buffer.
++
++Arguments:
++
++    TransA - Supplies the transpose operation on A matrix
++
++    TransB - Supplies the transpose operation on B matrix
++
++    N - Supplies the number of columns of matrix B.
++
++    K - Supplies the number of rows of matrix B.
++
++Return Value:
++
++    Returns the size in bytes for the packed matrix B buffer.
++
++--*/
++{
++    //
++    // Compute the number of bytes required to hold the packed buffer.
++    //
++    size_t bytes = 0;
++
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++        switch (TransB) {
++            case CblasNoTrans:
++                bytes = kai_get_rhs_packed_size_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme(N, K);
++                break;
++            case CblasTrans:
++                bytes = kai_get_rhs_packed_size_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(N, K);
++                break;
++            default:
++                throw ARMKleidiAI::NotSupported();
++                break;
++        }
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++
++    return bytes;
++}
++
++void
++MLASCALL
++ARMKleidiAI::MlasGemmPackB(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t N,
++    size_t K,
++    const float* B,
++    size_t ldb,
++    void* PackedB
++    )
++/*++
++
++Routine Description:
++
++    This routine packs the contents of matrix B to the destination buffer. The
++    destination buffer should be sized based on MlasGemmPackBSize(). For best
++    performance, the destination buffer should be aligned to the value returned
++    from MlasGetPreferredBufferAlignment().
++
++Arguments:
++
++    TransA - Supplies the transpose operation for matrix A.
++
++    TransB - Supplies the transpose operation for matrix B.
++
++    N - Supplies the number of columns of matrix B.
++
++    K - Supplies the number of rows of matrix B.
++
++    B - Supplies the address of matrix B.
++
++    ldb - Supplies the first dimension of matrix B.
++
++    PackedB - Supplies the address of packed matrix B.
++
++Return Value:
++
++    None.
++
++--*/
++{
++    MLAS_UNREFERENCED_PARAMETER(TransA);
++
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++
++        const size_t nr = kai_get_nr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t kr = kai_get_kr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t sr = kai_get_sr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        //pass zeroed bias values
++        const std::vector<float> bias(N);
++
++        switch (TransB) {
++            case CblasNoTrans:
++                kai_run_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme(1, N, K, nr, kr, sr,
++                                                                ldb*sizeof(float),
++                                                                B,
++                                                                bias.data(), nullptr,
++                                                                PackedB, 0, nullptr);
++                break;
++            case CblasTrans:
++                kai_run_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme(1, N, K, nr, kr, sr,
++                                                                ldb*sizeof(float),
++                                                                B,
++                                                                bias.data(), nullptr,
++                                                                PackedB, 0, nullptr);
++                break;
++            default:
++                throw ARMKleidiAI::NotSupported();
++                break;
++        }
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++}
++
++void
++MLASCALL
++ARMKleidiAI::MlasGemmBatch(
++    CBLAS_TRANSPOSE TransA,
++    CBLAS_TRANSPOSE TransB,
++    size_t M,
++    size_t N,
++    size_t K,
++    const MLAS_SGEMM_DATA_PARAMS* Data,
++    size_t BatchSize,
++    MLAS_THREADPOOL* ThreadPool
++    )
++{
++    if (TransA == CblasNoTrans && MLAS_CPUIDINFO::GetCPUIDInfo().HasArm_SME()) {
++
++        const size_t mr = kai_get_mr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t kr = kai_get_kr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        const size_t sr = kai_get_sr_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        auto m_step = kai_get_m_step_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++        auto n_step = kai_get_n_step_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa();
++
++        std::vector<MLAS_SGEMM_DATA_PARAMS> KaiPackedData;
++        KaiPackedData.resize(BatchSize);
++
++        size_t LhsPackedStride = 0;
++        std::byte* LhsPackedData = nullptr;
++
++        LhsPackedStride = kai_get_lhs_packed_size_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr);
++        auto LhsPacked = std::make_unique<std::byte[]>(LhsPackedStride * BatchSize);
++        LhsPackedData = LhsPacked.get();
++
++        std::unique_ptr<std::byte[]> RhsPacked{nullptr};
++
++        // It is assumed all B batches require packing or not
++        if (Data[0].BIsPacked) {
++            //We have already decided the matmul variant we are using, before having values for M,N,K
++            MlasTrySimpleParallel(ThreadPool, BatchSize, [&](ptrdiff_t batch_idx) {
++                std::byte *LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
++
++                kai_run_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr, 0,
++                    Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
++
++                KaiPackedData[batch_idx].A = reinterpret_cast<const float*>(LhsPackedPtr);
++                KaiPackedData[batch_idx].B = Data[batch_idx].B;
++            });
++        } else {
++
++            //Multithread pack lhs and rhs
++            size_t RhsPackedStride = 0;
++            std::byte* RhsPackedData = nullptr;
++
++            RhsPackedStride = ARMKleidiAI::MlasGemmPackBSize(TransA, TransB, N, K);
++            RhsPacked = std::make_unique<std::byte[]>(RhsPackedStride * BatchSize);
++            RhsPackedData = RhsPacked.get();
++
++            MlasTrySimpleParallel(ThreadPool, BatchSize*2, [&](ptrdiff_t batch_idx) {
++                //lhs odd, rhs even
++                if (batch_idx & 0x1) {
++                    batch_idx >>= 1;
++
++                    std::byte *LhsPackedPtr = &(LhsPackedData[LhsPackedStride * batch_idx]);
++
++                    kai_run_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr, 0,
++                        Data[batch_idx].A, Data[batch_idx].lda * sizeof(float), LhsPackedPtr);
++
++                    KaiPackedData[batch_idx].A = reinterpret_cast<const float*>(LhsPackedPtr);
++                } else {
++                    batch_idx >>= 1;
++
++                    std::byte *RhsPackedPtr = &(RhsPackedData[RhsPackedStride * batch_idx]);
++
++                    ARMKleidiAI::MlasGemmPackB(TransA, TransB, N, K, reinterpret_cast<const float*>(Data[batch_idx].B),
++                                               Data[batch_idx].ldb, RhsPackedPtr);
++
++                    KaiPackedData[batch_idx].B = reinterpret_cast<const float*>(RhsPackedPtr);
++                }
++            });
++        }
++
++        //tile iteration dimensions
++        std::array<size_t,3> dim;
++        dim[0] = BatchSize;                 // B
++        dim[1] = MlasDivRoundup(M, m_step); // M
++        dim[2] = MlasDivRoundup(N, n_step); // N
++
++        //Minimize the kernel call count for the number of available threads
++        auto RequiredTiles = std::min(static_cast<size_t>(MlasGetMaximumThreadCount(ThreadPool)), dim[0]*dim[1]*dim[2]);
++
++        //scale required tiles over available tile processors
++        dim[1] = MlasDivRoundup(RequiredTiles * dim[1], dim[1] + dim[2]);
++        dim[2] = MlasDivRoundup(RequiredTiles * dim[2], dim[1] + dim[2]);
++
++        //compute new step sizes
++        m_step *= MlasDivRoundup(MlasDivRoundup(M, dim[1]), m_step);
++        n_step *= MlasDivRoundup(MlasDivRoundup(N, dim[2]), n_step);
++
++        //update tile iterations
++        dim[1] = MlasDivRoundup(M, m_step);
++        dim[2] = MlasDivRoundup(N, n_step);
++
++        MlasTrySimpleParallel(ThreadPool,
++            static_cast<ptrdiff_t>(dim[0]*dim[1]*dim[2]),
++            [=](ptrdiff_t tid)
++        {
++            //compute B,M,N index from iteration index
++            ptrdiff_t BIdx = tid / (dim[1] * dim[2]);
++            ptrdiff_t MIdx = (tid % (dim[1] * dim[2])) / dim[2];
++            ptrdiff_t NIdx = (tid % (dim[1] * dim[2])) % dim[2];
++
++            //Get rhs tile, B
++            const size_t rhs_packed_offset =
++                kai_get_rhs_packed_offset_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(NIdx*n_step, K);
++
++            auto BTile = reinterpret_cast<const void*>(
++                reinterpret_cast<const std::byte*>(KaiPackedData[BIdx].B) + rhs_packed_offset);
++
++            // Get lhs tile, A
++            const size_t lhs_packed_offset =
++                kai_get_lhs_packed_offset_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(MIdx*m_step, K);
++
++            auto ATile = reinterpret_cast<const float*>(
++                reinterpret_cast<const std::byte*>(KaiPackedData[BIdx].A) + lhs_packed_offset);
++
++            auto TileSizeM = (MIdx+1)*m_step > M ? (M - MIdx*m_step) : m_step;
++            auto TileSizeN = (NIdx+1)*n_step > N ? (N - NIdx*n_step) : n_step;
++
++            //Get result tile, C
++            auto CTile = reinterpret_cast<void*>(
++                reinterpret_cast<std::byte*>(Data[BIdx].C) +
++                MIdx * m_step * Data[BIdx].ldc * sizeof(float) +
++                NIdx * n_step * sizeof(float)
++            );
++
++            kai_run_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(
++                TileSizeM,
++                TileSizeN,
++                K,
++                ATile, BTile, CTile,
++                Data[BIdx].ldc * sizeof(float), sizeof(float),
++                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
++        });
++
++    } else {
++        throw ARMKleidiAI::NotSupported();
++    }
++}
+-- 
+2.39.3 (Apple Git-146)
+
