@@ -1,19 +1,5 @@
-/*++
-
-Copyright (c) Microsoft Corporation.  All rights reserved.
-
-Licensed under the MIT License.
-
-Module Name:
-
-    mlasi.h
-
-Abstract:
-
-    This module contains the private data structures and procedure prototypes
-    for the ARM KleidiAI implementation of the Microsoft Machine Learning algebra subprogram library.
-
---*/
+// SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+// Licensed under the MIT License.
 
 #pragma once
 
@@ -78,6 +64,36 @@ MlasGemmBatch(
     size_t K,
     const MLAS_SGEMM_DATA_PARAMS* Data,
     size_t BatchSize,
+    MLAS_THREADPOOL* ThreadPool
+    );
+
+void MLASCALL
+MlasConvPrepare(MLAS_CONV_PARAMETERS* Parameters,
+                size_t Dimensions,
+                size_t BatchCount,
+                size_t GroupCount,
+                size_t InputChannels,
+                const int64_t* InputShape,
+                const int64_t* KernelShape,
+                const int64_t* DilationShape,
+                const int64_t* Padding,
+                const int64_t* StrideShape,
+                const int64_t* OutputShape,
+                size_t FilterCount,
+                const MLAS_ACTIVATION* Activation,
+                size_t* WorkingBufferSize,
+                float Beta,
+                MLAS_THREADPOOL* ThreadPool);
+
+void
+MLASCALL
+MlasConv(
+    const MLAS_CONV_PARAMETERS* Parameters,
+    const float* Input,
+    const float* Filter,
+    const float* Bias,
+    float* WorkingBuffer,
+    float* Output,
     MLAS_THREADPOOL* ThreadPool
     );
 }

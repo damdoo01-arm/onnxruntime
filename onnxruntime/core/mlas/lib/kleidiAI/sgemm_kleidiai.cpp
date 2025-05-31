@@ -1,19 +1,6 @@
-/*++
+// SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+// Licensed under the MIT License.
 
-Copyright (c) Microsoft Corporation. All rights reserved.
-
-Licensed under the MIT License.
-
-Module Name:
-
-    sgemm_kleidiai.cpp
-
-Abstract:
-
-    This module implements the KleidiAI single precision matrix/matrix multiply
-    operation (SGEMM).
-
---*/
 #include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p16vlx1b_1x16vl_sme2_mla.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p2vlx1b_1x16vl_sme2_mla.h"
 #include "kai/ukernels/matmul/matmul_clamp_f32_f32_f32p/kai_matmul_clamp_f32_f32_f32p8x1biasf32_6x8x4_neon_mla.h"
@@ -184,7 +171,7 @@ ARMKleidiAI::MlasGemmBatch(
         std::byte* LhsPackedData = nullptr;
 
         LhsPackedStride = kai_get_lhs_packed_size_lhs_pack_f32p2vlx1_f32_sme(M, K, mr, kr, sr);
-        auto LhsPacked = std::make_unique<std::byte[]>(LhsPackedStride * BatchSize);
+        auto LhsPacked = std::make_unique_for_overwrite<std::byte[]>(LhsPackedStride * BatchSize);
         LhsPackedData = LhsPacked.get();
 
         std::unique_ptr<std::byte[]> RhsPacked{nullptr};
@@ -208,7 +195,7 @@ ARMKleidiAI::MlasGemmBatch(
             std::byte* RhsPackedData = nullptr;
 
             RhsPackedStride = ARMKleidiAI::MlasGemmPackBSize(TransA, TransB, N, K);
-            RhsPacked = std::make_unique<std::byte[]>(RhsPackedStride * BatchSize);
+            RhsPacked = std::make_unique_for_overwrite<std::byte[]>(RhsPackedStride * BatchSize);
             RhsPackedData = RhsPacked.get();
 
             MlasTrySimpleParallel(ThreadPool, BatchSize*2, [&](ptrdiff_t batch_idx) {
@@ -245,8 +232,8 @@ ARMKleidiAI::MlasGemmBatch(
         auto RequiredTiles = std::min(static_cast<size_t>(MlasGetMaximumThreadCount(ThreadPool)), dim[0]*dim[1]*dim[2]);
 
         //scale required tiles over available tile processors
-        dim[1] = MlasDivRoundup(RequiredTiles * dim[1], dim[1] + dim[2]);
-        dim[2] = MlasDivRoundup(RequiredTiles * dim[2], dim[1] + dim[2]);
+        dim[1] = MlasDivRoundup(RequiredTiles * dim[1], dim[1] * dim[2]);
+        dim[2] = MlasDivRoundup(RequiredTiles * dim[2], dim[1] * dim[2]);
 
         //compute new step sizes
         m_step *= MlasDivRoundup(MlasDivRoundup(M, dim[1]), m_step);

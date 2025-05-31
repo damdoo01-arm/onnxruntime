@@ -269,6 +269,7 @@ function(setup_kleidiai)
   target_sources(onnxruntime_mlas PRIVATE
     ${MLAS_SRC_DIR}/kai_ukernel_interface.cpp
     ${MLAS_SRC_DIR}/kleidiai/sgemm_kleidiai.cpp
+    ${MLAS_SRC_DIR}/kleidiai/convolve_kleidiai.cpp
   )
   target_link_libraries(onnxruntime_mlas PRIVATE kleidiai)
 endfunction()
@@ -297,7 +298,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
 elseif(MSVC)
   setup_mlas_source_for_windows()
 else()
-
     if(APPLE)
         get_target_property(ONNXRUNTIME_MLAS_OSX_ARCH onnxruntime_mlas OSX_ARCHITECTURES)
 
