@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <map>
+#include <iostream>
 #include <algorithm>
 #include "mlasi_kleidiai.h"
 
@@ -35,27 +36,6 @@ static constexpr size_t ComputeConvOutSize(const size_t L, const size_t K, const
         // (L+2*P)-(K-1) the 1D length of convolution result for a kernel step size of 1
         // /S apply the kernel step
         return (((L - K) + (2 * P)) / S) + 1;
-    }
-    return 0;
-}
-
-static constexpr size_t ComputeConvOutSizeAlt(const size_t L, const size_t K, const size_t P, const size_t S) {
-
-    //Alternative
-    //With start or end padding only
-
-    //L - input size
-    //K - kernel size
-    //P - Padding size
-    //S - stride size
-
-    //Does the convolution compute one value or less ?
-    if ( S > 0 && (L + P) >= K) {
-        // L-(K-1) standard convolution output size is L-(K-1) for a step size of 1 with no padding
-        // (P) 1D start OR end padding
-        // (L+P)-(K-1) the 1D length of convolution result for a kernel step size of 1
-        // /S apply the kernel step
-        return (((L - K) + P) / S) + 1;
     }
     return 0;
 }
@@ -189,7 +169,7 @@ static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
                   el[3]];
     };
 
-    const size_t set_strides[] {dilationh*h*dilationw*w*c,dilationw*w*c,c};
+    const size_t set_strides[] {d_h*d_w*c,dilationh*d_w*c,dilationw*c};
     auto set = [set_strides](const std::array<size_t, 4>& el, float v, float* out) {
         out[el[0]*set_strides[0] +
             el[1]*set_strides[1] +
@@ -197,14 +177,33 @@ static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
             el[3]] = v;
     };
 
-    for (size_t s0 = 0; s0 < n; ++s0) {
-        for (size_t s1 = 0; s1 < c; ++s1) {
-            for (size_t s2 = 0; s2 < h; ++s2) {
-                for (size_t s3 = 0; s3 < w; ++s3) {
-                    set({s0,s2,s3,s1}, get({s0,s1,s2,s3}),t.get());
+    MLAS_UNREFERENCED_PARAMETER(set);
+    MLAS_UNREFERENCED_PARAMETER(get);
+
+    auto out0 = t.get();
+    auto in0 = in;
+    for (size_t s0 = n; s0 > 0; --s0) {
+        auto out1 = out0;
+        auto in1 = in0;
+        for (size_t s1 = c; s1 > 0; --s1) {
+            auto out2 = out1;
+            auto in2 = in1;
+            for (size_t s2 = h; s2 > 0; --s2) {
+                auto out3 = out2;
+                auto in3 = in2;
+                for (size_t s3 = w; s3 > 0; --s3) {
+                    //set({s0,s2,s3,s1}, get({s0,s1,s2,s3}),t.get());
+                    *out3 = *in3++;
+                    out3 = &out3[set_strides[2]];
                 }
+                out2 = &out2[set_strides[1]];
+                in2 = &in2[get_strides[2]];
             }
+            out1++;
+            in1 = &in1[get_strides[1]];
         }
+        out0 = &out0[set_strides[0]];
+        in0 = &in0[get_strides[0]];
     }
 
     return t;
@@ -212,7 +211,8 @@ static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
 
 static void MultiThreadedLHSPackSme(MLAS_THREADPOOL* ThreadPool, const size_t ci, const size_t m, const size_t kh,
                                     const size_t kw, const void * const* lhs_ptrs, std::byte* lhs_data,
-                                    const float* in_data) {
+                                    const float* in_data,
+                                    const float* pad_ptr) {
 
     auto m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa();
 
@@ -228,35 +228,53 @@ static void MultiThreadedLHSPackSme(MLAS_THREADPOOL* ThreadPool, const size_t ci
         auto offset = kai_get_lhs_packed_offset_lhs_imatmul_pack_x32p2vlx1_x32p_sme(m_idx,kh*kw,ci);
 
         kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme(
-            m < (m_idx + m_step) ? m - m_idx : m_step, kh*kw, ci,
-            lhs_ptrs + m_idx*kh*kw*ci,
+            m < (m_idx + m_step) ? m - m_idx : m_step, kh * kw, ci,
+            lhs_ptrs + m_idx * kh * kw,
             reinterpret_cast<size_t>(in_data),
-            //This is because there will be a conflict between having a zero offset in lhs_ptrs[] and specifying
-            //nullptr as pad_ptr
-            reinterpret_cast<void*>(-1),
-            lhs_data+offset
+            reinterpret_cast<const void*>(pad_ptr),
+            lhs_data + offset
         );
     });
 }
 
 using CacheKey = float const * const;
-static CacheKey GenerateKey(const float* weights, const size_t dilationh, const size_t dilationw) {
+static CacheKey GenerateRhsKey(const size_t co, const size_t ci,
+                               const size_t kh, const size_t kw,
+                               const size_t dilationh, const size_t dilationw,
+                               const float* weights) {
 
     //Weights, co, ci, kh, kw are constants. Dilation factors could vary
     //Encode the dilation factors into key
-    return &weights[(dilationh * 4) + dilationw];
+    auto key = &weights[(dilationh*2) + dilationw];
+    if (key != std::clamp(key, &weights[0], &weights[(co * ci * kh * kw) - 1])) {
+        throw std::invalid_argument("Invalid Rhs key");
+    }
+    return key;
 }
 
-static bool ValidateKey(CacheKey key,
-                        const size_t co, const size_t ci,
-                        const size_t kh, const size_t kw,
-                        const size_t dilationh, const size_t dilationw,
-                        const float* weights) {
+static CacheKey GenerateLhsKey(const size_t ci,
+                               const size_t ih, const size_t iw,
+                               const size_t padding, const size_t sh, const size_t sw,
+                               const size_t kh, const size_t kw,
+                               const size_t dilationh, const size_t dilationw,
+                               const float* data) {
+    //Data, ci, ih, iw are constants.
+    //Encode the others into key
+    const auto d_kh = ComputeKernelSize(dilationh, kh);
+    const auto d_kw = ComputeKernelSize(dilationw, kw);
 
-    return key != std::clamp(key, &weights[0], &weights[(co * ci * kh * kw) - 1]);
+    auto ih_out_size = ComputeConvOutSize(ih, d_kh, padding, sh);
+    auto iw_out_size = ComputeConvOutSize(iw, d_kw, padding, sw);
+
+    auto key = &data[ih_out_size * 2 + iw_out_size];
+    if (key != std::clamp(key, &data[0], &data[(ci * ih * iw) - 1])) {
+        throw std::invalid_argument("Invalid Lhs key");
+    }
+    return key;
 }
 
-static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const size_t ci,
+static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(CacheKey key,
+                                                          const size_t co, const size_t ci,
                                                           const size_t kh, const size_t kw,
                                                           const size_t dilationh, const size_t dilationw,
                                                           const float* weights, const float* bias)
@@ -264,13 +282,8 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
     //cache of prepacked kai rhs weights and biases
     static std::map<CacheKey, std::shared_ptr<std::byte[]>> rhs_cache;
 
-    //Query conv rhs cache
-    //Weights, co, ci, kh, kw are constants. Dilation factors could vary
-    //Encode the dilation factors into key
-    auto key = GenerateKey(weights,dilationh,dilationw);
-
     //sanity check key
-    if (ValidateKey(key,co,ci,kh,kw,dilationh,dilationw,weights) || rhs_cache.count(key) > 1) {
+    if (rhs_cache.count(key) > 1) {
         throw std::invalid_argument("Invalid conv rhs key");
     }
 
@@ -301,19 +314,21 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(const size_t co, const
     }
 }
 
-static std::unique_ptr<const void*[]> LhsPtrFillNoPadding(const size_t ci, const size_t ih, const size_t iw,
-                                                          const size_t kh, const size_t kw, size_t sh, size_t sw) {
+static std::shared_ptr<const void*[]> LhsPtrFill(const size_t ci, const size_t ih, const size_t iw,
+                                                 const size_t kh, const size_t kw, size_t sh, size_t sw,
+                                                 const size_t padding,
+                                                 const float* pad_ptr) {
     size_t check_filled{0};
 
-    const auto m = ComputeConvOutSize(ih, kh, 0, sh) * ComputeConvOutSize(iw, kw, 0, sw);
+    const auto m = ComputeConvOutSize(ih, kh, padding, sh) * ComputeConvOutSize(iw, kw, padding, sw);
 
     const auto m_step = kai_get_m_step_imatmul_clamp_f32_f32p2vlx1_f32p2vlx1b_2vlx2vl_sme2_mopa();
     const auto lhs_ptrs_k = kh * kw;
     const auto lhs_ptrs_m = m_step * MlasDivRoundup(m, m_step);
-    auto lhs_ptrs = std::make_unique_for_overwrite<const void*[]>(lhs_ptrs_k * lhs_ptrs_m);
+    auto lhs_ptrs = std::make_shared_for_overwrite<const void*[]>(lhs_ptrs_k * lhs_ptrs_m);
 
-    auto ih_out_size = ComputeConvOutSize(ih, kh, 0, 1);
-    auto iw_out_size = ComputeConvOutSize(iw, kw, 0, 1);
+    auto ih_out_size = ComputeConvOutSize(ih, kh, padding, 1);
+    auto iw_out_size = ComputeConvOutSize(iw, kw, padding, 1);
 
     auto ptrs_offset = [lhs_ptrs_m,lhs_ptrs_k, m_step](size_t k, size_t m) {
         //(m/m_step,transpose(m_step,k)
@@ -325,18 +340,25 @@ static std::unique_ptr<const void*[]> LhsPtrFillNoPadding(const size_t ci, const
         return offset;
     };
 
-    #if !defined(NDEBUG)
-    size_t max_offset = ih * iw * ci;
-    auto pixel_offset = [max_offset, iw, ci](size_t h, size_t w) {
-        auto offset = h * iw * ci + w * ci;
-        assert(offset < max_offset);
-        return offset;
+    auto pixel_offset = [ih, iw, ci, pad_ptr, padding](size_t h, size_t w) {
+        if (h < padding) {
+            return reinterpret_cast<size_t>(&pad_ptr[0]);
+        }
+        h -= padding;
+
+        if (w < padding) {
+            return reinterpret_cast<size_t>(&pad_ptr[0]);
+        }
+        w -= padding;
+
+        if ((h >= ih) || (w >= iw)) {
+            return reinterpret_cast<size_t>(&pad_ptr[0]);
+        }
+
+        auto offset{h * iw * ci + w * ci};
+        assert(offset < (ih*iw*ci));
+        return offset*sizeof(float);
     };
-    #else
-    auto pixel_offset = [iw, ci](size_t h, size_t w) {
-        return h * iw * ci + w * ci;
-    };
-    #endif
 
     size_t m_{0};
     auto lhs_ptrs_ = lhs_ptrs.get();
@@ -345,8 +367,7 @@ static std::unique_ptr<const void*[]> LhsPtrFillNoPadding(const size_t ci, const
             size_t k_{0};
             for (size_t kh_ = 0; kh_ < kh; ++kh_) {
                 for (size_t kw_ = 0; kw_ < kw; ++kw_) {
-                    lhs_ptrs_[ptrs_offset(k_, m_)] = reinterpret_cast<void*>(pixel_offset(ih_+kh_, iw_+kw_)*
-                                                                             sizeof(float));
+                    lhs_ptrs_[ptrs_offset(k_, m_)] = reinterpret_cast<void*>(pixel_offset(ih_+kh_, iw_+kw_));
                     k_++; check_filled++;
                 }
             }
@@ -359,11 +380,15 @@ static std::unique_ptr<const void*[]> LhsPtrFillNoPadding(const size_t ci, const
     return lhs_ptrs;
 }
 
-static std::unique_ptr<std::byte[]> LhsPackImageDataSme(const size_t ci, const size_t ih, const size_t iw,
+static std::unique_ptr<std::byte[]> LhsPackImageDataSme(CacheKey key,
+                                                        const size_t ci, const size_t ih, const size_t iw,
                                                         const size_t kh, const size_t kw, const size_t sh,
                                                         const size_t sw, const size_t padding, const float* in,
                                                         MLAS_THREADPOOL* ThreadPool)
 {
+    static const std::array<float, 256> pad_ptr{0.f};
+    assert(pad_ptr.size() > ci);
+
     //create lhs in format required for imatmul
     const auto m = ComputeConvOutSize(ih, kh, padding, sh) * ComputeConvOutSize(iw, kw, padding, sw);
 
@@ -372,15 +397,23 @@ static std::unique_ptr<std::byte[]> LhsPackImageDataSme(const size_t ci, const s
 
     auto nhwc = NChwToNhwc(1, ci, ih, iw, in);
 
-    //it is easier to keep some use case implementations separate
-    if (padding == 0) {
+    //cache of computed lhs ptr offsets
+    static std::map<CacheKey, std::shared_ptr<const void*[]>> lhs_ptrs_cache;
 
-        //generate lhs pointers without padding
-        auto lhs_ptrs = LhsPtrFillNoPadding(ci, ih, iw, kh, kw, sh, sw);
-        MultiThreadedLHSPackSme(ThreadPool, ci, m, kh, kw, &lhs_ptrs[0], &lhs[0], &nhwc[0]);
+    // sanity check key
+    if (lhs_ptrs_cache.count(key) > 1) {
+        throw std::invalid_argument("Invalid conv lhs_ptrs key");
     }
 
-    (void) ComputeConvOutSizeAlt;
+    std::shared_ptr<const void*[]> lhs_ptrs;
+    if (auto found = lhs_ptrs_cache.find(key); found != lhs_ptrs_cache.end()) {
+        lhs_ptrs = found->second;
+    } else {
+        lhs_ptrs = LhsPtrFill(ci, ih, iw, kh, kw, sh, sw, padding, &pad_ptr[0]);
+        lhs_ptrs_cache[key] = lhs_ptrs;
+    }
+
+    MultiThreadedLHSPackSme(ThreadPool, ci, m, kh, kw, &lhs_ptrs[0], &lhs[0], &nhwc[0], &pad_ptr[0]);
 
     return lhs;
 }
@@ -449,8 +482,11 @@ static void ConvolveSme(const size_t co, //channels out
             result = tmp_mlas_aligned;
         }
 
-        auto lhs = LhsPackImageDataSme(ci, ih, iw, d_kh, d_kw, sh, sw, padding, in, ThreadPool);
-        auto rhs = RhsPackWeightsBiasSme(co, ci, kh, kw, dilationh, dilationw, weights, bias);
+        auto rhs_key = GenerateRhsKey(co, ci, kh, kw, dilationh, dilationw, weights);
+        auto lhs_key = GenerateLhsKey(ci, ih, iw, padding, sh, sw, kh, kw, dilationh, dilationw, in);
+
+        auto lhs = LhsPackImageDataSme(lhs_key, ci, ih, iw, d_kh, d_kw, sh, sw, padding, in, ThreadPool);
+        auto rhs = RhsPackWeightsBiasSme(rhs_key, co, ci, kh, kw, dilationh, dilationw, weights, bias);
 
         MlasTrySimpleParallel(ThreadPool,
             static_cast<ptrdiff_t>(dim[0]*dim[1]*dim[2]),
