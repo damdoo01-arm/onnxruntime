@@ -325,12 +325,18 @@ static std::unique_ptr<const void*[]> LhsPtrFillNoPadding(const size_t ci, const
         return offset;
     };
 
-    auto pixel_offset = [ih, iw, ci](size_t h, size_t w) {
-        auto offset { h * iw * ci + w * ci };
-        assert(offset < (ih*iw*ci));
-
+    #if !defined(NDEBUG)
+    size_t max_offset = ih * iw * ci;
+    auto pixel_offset = [max_offset, iw, ci](size_t h, size_t w) {
+        auto offset = h * iw * ci + w * ci;
+        assert(offset < max_offset);
         return offset;
     };
+    #else
+    auto pixel_offset = [iw, ci](size_t h, size_t w) {
+        return h * iw * ci + w * ci;
+    };
+    #endif
 
     size_t m_{0};
     auto lhs_ptrs_ = lhs_ptrs.get();
