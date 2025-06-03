@@ -98,6 +98,7 @@ static void CheckCapabilitiesSme(const MLAS_CONV_PARAMETERS* Parameters) {
     }
 }
 
+//General purpose axis swapping
 static auto Transpose4D(std::array<const size_t,4> shape_in,
                         const float* in,
                         std::array<const size_t,4> permute) {
@@ -144,14 +145,16 @@ static auto Transpose4D(std::array<const size_t,4> shape_in,
     return out_;
 }
 
+//nchw to nhwc specific axis swapping
 static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
                                            const size_t c,
                                            const size_t h,
                                            const size_t w,
-                                           const float* in,
+                                           const float* __restrict__ in,
                                            const size_t dilationh=1,
                                            const size_t dilationw=1,
-                                           const bool zero_fill=false) {
+                                           const bool zero_fill=false,
+                                           MLAS_THREADPOOL* ThreadPool=nullptr) {
 
     const auto d_h = ComputeKernelSize(dilationh, h);
     const auto d_w = ComputeKernelSize(dilationw, w);
@@ -161,49 +164,59 @@ static std::unique_ptr<float[]> NChwToNhwc(const size_t n,
         std::fill(&t.get()[0], &t.get()[n*d_h*d_w*c], 0.f);
     }
 
-    const size_t get_strides[] {c*h*w,h*w,w};
-    auto get = [get_strides,in](const std::array<size_t, 4>& el) {
-        return in[el[0]*get_strides[0] +
-                  el[1]*get_strides[1] +
-                  el[2]*get_strides[2] +
-                  el[3]];
-    };
+    if (dilationh > 1 || dilationw > 1 || n > 1) {
+        const size_t get_strides[] {c*h*w,h*w,w};
+        auto get = [get_strides,in](const std::array<size_t, 4>& el) {
+            return in[el[0]*get_strides[0] +
+                    el[1]*get_strides[1] +
+                    el[2]*get_strides[2] +
+                    el[3]];
+        };
 
-    const size_t set_strides[] {d_h*d_w*c,dilationh*d_w*c,dilationw*c};
-    auto set = [set_strides](const std::array<size_t, 4>& el, float v, float* out) {
-        out[el[0]*set_strides[0] +
-            el[1]*set_strides[1] +
-            el[2]*set_strides[2] +
-            el[3]] = v;
-    };
+        const size_t set_strides[] {d_h*d_w*c,dilationh*d_w*c,dilationw*c};
+        auto set = [set_strides](const std::array<size_t, 4>& el, float v, float* out) {
+            out[el[0]*set_strides[0] +
+                el[1]*set_strides[1] +
+                el[2]*set_strides[2] +
+                el[3]] = v;
+        };
 
-    MLAS_UNREFERENCED_PARAMETER(set);
-    MLAS_UNREFERENCED_PARAMETER(get);
+        MLAS_UNREFERENCED_PARAMETER(set);
+        MLAS_UNREFERENCED_PARAMETER(get);
 
-    auto out0 = t.get();
-    auto in0 = in;
-    for (size_t s0 = n; s0 > 0; --s0) {
-        auto out1 = out0;
-        auto in1 = in0;
-        for (size_t s1 = c; s1 > 0; --s1) {
-            auto out2 = out1;
-            auto in2 = in1;
-            for (size_t s2 = h; s2 > 0; --s2) {
-                auto out3 = out2;
-                auto in3 = in2;
-                for (size_t s3 = w; s3 > 0; --s3) {
-                    //set({s0,s2,s3,s1}, get({s0,s1,s2,s3}),t.get());
-                    *out3 = *in3++;
-                    out3 = &out3[set_strides[2]];
+        auto out0 = t.get();
+        for (size_t s0 = n; s0 > 0; --s0) {
+            auto out1 = out0;
+            for (size_t s1 = c; s1 > 0; --s1) {
+                auto out2 = out1;
+                for (size_t s2 = h; s2 > 0; --s2) {
+                    float* __restrict__ out3 = out2;
+                    size_t s3 = w;
+                    for (; s3 > 4; s3 -= 4) {
+                        auto vf32 = MlasLoadFloat32x4(in);
+                        in += 4;
+                        MlasStoreLaneFloat32x4<0>(out3,vf32);
+                        out3 += set_strides[2];
+                        MlasStoreLaneFloat32x4<1>(out3,vf32);
+                        out3 += set_strides[2];
+                        MlasStoreLaneFloat32x4<2>(out3,vf32);
+                        out3 += set_strides[2];
+                        MlasStoreLaneFloat32x4<3>(out3, vf32);
+                        out3 += set_strides[2];
+                    }
+                    for (; s3 > 0; --s3) {
+                        //set({s0,s2,s3,s1}, get({s0,s1,s2,s3}),t.get());
+                        *out3 = *in++;
+                        out3 += set_strides[2];
+                    }
+                    out2 += set_strides[1];
                 }
-                out2 = &out2[set_strides[1]];
-                in2 = &in2[get_strides[2]];
+                out1++;
             }
-            out1++;
-            in1 = &in1[get_strides[1]];
+            out0 += set_strides[0];
         }
-        out0 = &out0[set_strides[0]];
-        in0 = &in0[get_strides[0]];
+    } else {
+        MlasTranspose(in, t.get(), c, d_h*d_w, ThreadPool);
     }
 
     return t;
@@ -238,6 +251,7 @@ static void MultiThreadedLHSPackSme(MLAS_THREADPOOL* ThreadPool, const size_t ci
 }
 
 using CacheKey = float const * const;
+//Generate a unique key for rhs weight packing caching
 static CacheKey GenerateRhsKey(const size_t co, const size_t ci,
                                const size_t kh, const size_t kw,
                                const size_t dilationh, const size_t dilationw,
@@ -252,6 +266,7 @@ static CacheKey GenerateRhsKey(const size_t co, const size_t ci,
     return key;
 }
 
+//Generate a unique key for lhs indirection pointer array caching
 static CacheKey GenerateLhsKey(const size_t ci,
                                const size_t ih, const size_t iw,
                                const size_t padding, const size_t sh, const size_t sw,
@@ -277,7 +292,8 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(CacheKey key,
                                                           const size_t co, const size_t ci,
                                                           const size_t kh, const size_t kw,
                                                           const size_t dilationh, const size_t dilationw,
-                                                          const float* weights, const float* bias)
+                                                          const float* weights, const float* bias,
+                                                          MLAS_THREADPOOL* ThreadPool)
 {
     //cache of prepacked kai rhs weights and biases
     static std::map<CacheKey, std::shared_ptr<std::byte[]>> rhs_cache;
@@ -292,7 +308,7 @@ static std::shared_ptr<std::byte[]> RhsPackWeightsBiasSme(CacheKey key,
     } else {
         // prepare mlas filter weights for kai rhs packing
         // dilated nhwc format
-        auto nhwc = NChwToNhwc(co,ci,kh,kw,weights,dilationh,dilationw,true);
+        auto nhwc = NChwToNhwc(co, ci, kh, kw, weights, dilationh, dilationw, true, ThreadPool);
 
         //dilation, axis swap (n x k -> k x n) where n == co, k == d_kh x d_kw x ci
         const auto d_kh = ComputeKernelSize(dilationh,kh);
@@ -395,7 +411,7 @@ static std::unique_ptr<std::byte[]> LhsPackImageDataSme(CacheKey key,
     const auto lhs_size = kai_get_lhs_packed_size_lhs_imatmul_pack_x32p2vlx1_x32p_sme(m,kh*kw,ci);
     auto lhs = std::make_unique_for_overwrite<std::byte[]>(lhs_size);
 
-    auto nhwc = NChwToNhwc(1, ci, ih, iw, in);
+    auto nhwc = NChwToNhwc(1, ci, ih, iw, in, 1, 1, false, ThreadPool);
 
     //cache of computed lhs ptr offsets
     static std::map<CacheKey, std::shared_ptr<const void*[]>> lhs_ptrs_cache;
@@ -486,7 +502,7 @@ static void ConvolveSme(const size_t co, //channels out
         auto lhs_key = GenerateLhsKey(ci, ih, iw, padding, sh, sw, kh, kw, dilationh, dilationw, in);
 
         auto lhs = LhsPackImageDataSme(lhs_key, ci, ih, iw, d_kh, d_kw, sh, sw, padding, in, ThreadPool);
-        auto rhs = RhsPackWeightsBiasSme(rhs_key, co, ci, kh, kw, dilationh, dilationw, weights, bias);
+        auto rhs = RhsPackWeightsBiasSme(rhs_key, co, ci, kh, kw, dilationh, dilationw, weights, bias, ThreadPool);
 
         MlasTrySimpleParallel(ThreadPool,
             static_cast<ptrdiff_t>(dim[0]*dim[1]*dim[2]),
