@@ -2,7 +2,7 @@ name: ONNX KleidiAI MSVC Test
 
 on:
   push:
-    branches: [kleidiai-ci-test]
+    branches: [test_msvc_co]
   workflow_dispatch:
 
 jobs:
