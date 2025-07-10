@@ -30,10 +30,14 @@ jobs:
       run: |
         python tools/ci_build/build.py `
           --config RelWithDebInfo `
+          --build_dir 'D:\a\_work\1\b' `
           --cmake_generator "Visual Studio 17 2022" `
           --build_shared_lib `
           --use_vcpkg `
+          --use_vcpkg_ms_internal_asset_cache `
+          --use_qnn shared_lib `
           --parallel `
           --build_dir build/windows `
+          --qnn_home 'D:\a\_work\_temp\qnn-v2.36.0.250627' `
           --update `
           --build
