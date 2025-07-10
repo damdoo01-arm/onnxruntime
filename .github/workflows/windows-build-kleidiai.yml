@@ -38,6 +38,5 @@ jobs:
           --use_qnn shared_lib `
           --parallel `
           --build_dir build/windows `
-          --qnn_home 'D:\a\_work\_temp\qnn-v2.36.0.250627' `
           --update `
           --build
