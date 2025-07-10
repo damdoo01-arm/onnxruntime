@@ -1,0 +1,39 @@
+name: ONNX KleidiAI MSVC Test
+
+on:
+  push:
+    branches: [kleidiai-ci-test]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup MSVC (x64 cross ARM64)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: amd64_arm64
+
+    - name: Install Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install numpy
+
+    - name: Configure and Build ONNX Runtime
+      run: |
+        python tools/ci_build/build.py `
+          --config RelWithDebInfo `
+          --cmake_generator "Visual Studio 17 2022" `
+          --build_shared_lib `
+          --use_vcpkg `
+          --parallel `
+          --build_dir build/windows `
+          --update `
+          --build
