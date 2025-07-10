@@ -35,7 +35,6 @@ jobs:
           --build_shared_lib `
           --use_vcpkg `
           --use_vcpkg_ms_internal_asset_cache `
-          --use_qnn shared_lib `
           --parallel `
           --build_dir build/windows `
           --update `
