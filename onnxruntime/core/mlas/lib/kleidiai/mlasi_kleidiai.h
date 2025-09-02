@@ -7,6 +7,7 @@
 #pragma once
 
 #include "mlasi.h"
+#include <iostream>
 
 // Fix to ensure compatibility with MSVC build
 #if defined(_MSC_VER)
@@ -14,6 +15,35 @@
 #else
   #define RESTRICT __restrict__
 #endif
+
+// Logging macros.
+#ifndef KLEIDIAI_DEBUG
+#define KLEIDIAI_DEBUG 0
+#endif
+#ifndef KLEIDIAI_KERNEL
+#define KLEIDIAI_KERNEL 0
+#endif
+
+// General logging. "tag" is expected to quality the type of message.
+#define KLEIDIAI_LOG(tag, msg) std::cout << "[KLEIDIAI " << tag << "]: " << msg << std::endl;
+
+#if KLEIDIAI_DEBUG
+    // General debug messages.
+    #define KLEIDIAI_DEBUG_LOG(msg) KLEIDIAI_LOG("DEBUG", msg)
+#else
+    #define KLEIDIAI_DEBUG_LOG(msg)
+#endif
+
+#if KLEIDIAI_KERNEL
+    // Messages specifically written before a call to kai_run.
+    // Note: In cases where a kernel is called in multiple threads, for example MlasTrySimpleParallel,
+    // the output order can be inconsistient. The solution is to set the intra-node thread size to 1.
+    // If using onnxruntime_perf_test this is done with "--x 1".
+    #define KLEIDIAI_KERNEL_LOG(kernel_name) KLEIDIAI_LOG("KERNEL", kernel_name)
+#else
+    #define KLEIDIAI_KERNEL_LOG(msg)
+#endif
+
 namespace ArmKleidiAI {
 //
 // Buffer packing routines.
@@ -26,6 +56,15 @@ MlasGemmPackBSize(
     CBLAS_TRANSPOSE TransB,
     size_t N,
     size_t K
+    );
+
+size_t
+MLASCALL
+MlasGemmPackBSize(
+    size_t N,
+    size_t K,
+    bool AIsSigned,
+    bool BIsSigned
     );
 
 bool
@@ -42,6 +81,18 @@ MlasGemmPackB(
 
 bool
 MLASCALL
+MlasGemmPackB(
+    size_t N,
+    size_t K,
+    const uint8_t* B,
+    size_t ldb,
+    bool AIsSigned,
+    bool BIsSigned,
+    void* PackedB
+    );
+
+bool
+MLASCALL
 MlasGemmBatch(
     CBLAS_TRANSPOSE TransA,
     CBLAS_TRANSPOSE TransB,
@@ -53,12 +104,21 @@ MlasGemmBatch(
     MLAS_THREADPOOL* ThreadPool
     );
 
+bool
+MLASCALL
+MlasGemmBatch(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL*
+    );
+
 size_t
 MLASCALL
 MlasDynamicQgemmPackBSize(
     size_t N,
     size_t K
-);
+    );
 
 void
 MLASCALL
@@ -111,4 +171,14 @@ MlasConv(
     float* Output,
     MLAS_THREADPOOL* ThreadPool
     );
+
+// CONV INTEGER / QGEMM
+
+bool
+MLASCALL
+MlasGemmBatchConvInteger(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL* ThreadPool);
 }

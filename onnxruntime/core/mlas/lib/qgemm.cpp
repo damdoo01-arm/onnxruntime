@@ -139,6 +139,11 @@ MlasGemmBatch(
     const size_t BatchN,
     MLAS_THREADPOOL* ThreadPool)
 {
+    if(GetMlasPlatform().MlasQGemmBatchOverride != nullptr &&
+        GetMlasPlatform().MlasQGemmBatchOverride(Shape, DataParams, BatchN, ThreadPool)){
+        return;
+    }
+
     const size_t M = Shape.M;
     const size_t N = Shape.N;
     const size_t K = Shape.K;
@@ -379,10 +384,16 @@ Return Value:
 
 --*/
 {
-    //
-    // Retrieve the packing parameters.
-    //
-
+#if defined(USE_KLEIDIAI) && !defined(_MSC_VER)
+    if (GetMlasPlatform().MlasQGemmPackBSizeOverride != nullptr){
+        size_t bytes_required;
+        //TODO pass status by reference to indicate success/fail
+        bytes_required = GetMlasPlatform().MlasQGemmPackBSizeOverride(N, K, AIsSigned, BIsSigned);
+        if (bytes_required != 0){// If ArmKleidiAI::MlasGemmPackBSize ran to completion
+            return bytes_required;
+        }
+    }
+#endif
     const auto* GemmQuantDispatch = MlasGemmQuantGetDispatch(AIsSigned, BIsSigned);
 
     size_t PackedK = GemmQuantDispatch->PackedK;
@@ -476,6 +487,10 @@ Return Value:
 
 --*/
 {
+    if(GetMlasPlatform().MlasQGemmPackBOverride != nullptr &&
+        GetMlasPlatform().MlasQGemmPackBOverride(N, K, B, ldb, AIsSigned, BIsSigned, PackedB)){
+        return;
+    }
     //
     // Retrieve the packing parameters.
     //

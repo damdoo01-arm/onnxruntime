@@ -151,6 +151,19 @@ Status MatMulIntegerToFloatBase::ComputeCommon(OpKernelContext* ctx,
     params.PerColumnZeroPoints = is_b_zp_per_column;
     params.C = reinterpret_cast<int32_t*>(y_data + helper.OutputOffsets()[gemm_idx]);
     params.ldc = gemm_shape.N;
+
+    if (is_b_scale_per_column) {
+      params.PerColumnScale  = true;
+      params.Scale           =  multipliers_per_column.data();
+      params.RightScaleOffset = helper.RightScaleOffsets()[gemm_idx];
+    } else {
+      params.PerColumnScale  = false;
+      params.Scale           = &multiplier_per_tensor;
+      params.RightScaleOffset = 0;
+    }
+    params.Bias = bias_data;
+    params.ClampMin = nullptr;
+    params.ClampMax = nullptr;
   }
 
   MlasGemmBatch(gemm_shape, gemm_data_vec.data(), num_gemms, ctx->GetOperatorThreadPool());
@@ -199,17 +212,15 @@ class DynamicQuantizeMatMul final : public MatMulIntegerToFloatBase {
       const bool b_scale_available = Info().TryGetConstantInput(IN_B_SCALE, &b_scale_tensor);
 
       can_use_dynamic_quant_mlas_ = (!b_quantization_might_be_asymmetric && b_scale_available);
-
-      // Kleidi dynamic path requires strictly positive, finite scales.
-      // Disable if any invalid scale is detected.
+      // Kleidi dynamic path expects non-negative scales. Disable if any negative scale is detected.
       if (can_use_dynamic_quant_mlas_) {
-        const auto bs = b_scale_tensor->DataAsSpan<float>();
-        const bool has_invalid =
-            std::any_of(bs.begin(), bs.end(),
-                        [](float s) { return !std::isfinite(s) || s <= 0.0f; });
-
-        if (has_invalid) {
-          can_use_dynamic_quant_mlas_ = false;
+        const float* bs_data = b_scale_tensor->Data<float>();
+        const size_t bs_size = static_cast<size_t>(b_scale_tensor->Shape().Size());
+        for (size_t i = 0; i < bs_size; ++i) {
+          if (bs_data[i] < 0.0f) {
+            can_use_dynamic_quant_mlas_ = false;
+            break;
+          }
         }
       }
 
@@ -392,7 +403,7 @@ Status DynamicQuantizeMatMul::Compute(OpKernelContext* ctx) const {
     if (y->Shape().Size() == 0)
       return Status::OK();
 
-    const float* a_data = ctx->Input<Tensor>(IN_A)->Data<float>();
+    auto a_data = ctx->Input<Tensor>(IN_A)->Data<float>();
     auto* y_data = y->MutableData<float>();
 
     // batch gemm
@@ -414,22 +425,6 @@ Status DynamicQuantizeMatMul::Compute(OpKernelContext* ctx) const {
     }
 
     MlasDynamicQGemmBatch(gemm_shape, gemm_data_vec.data(), num_gemms, ctx->GetOperatorThreadPool());
-    // This evaluates to true if bias data was not provided as constant data for prepacking stage
-    if (!dynamic_quant_mlas_bias_data_was_packed_) {
-      if (ctx->Input<Tensor>(IN_BIAS) != nullptr) {
-        const auto biases = std::vector<float>(&ctx->Input<Tensor>(IN_BIAS)->Data<float>()[0],
-                                               &ctx->Input<Tensor>(IN_BIAS)->Data<float>()[gemm_shape.N]);
-
-        // deferred adding of bias
-        for (size_t gemm_idx = 0; gemm_idx < num_gemms; gemm_idx++) {
-          float* MxN = y_data + helper.OutputOffsets()[gemm_idx];
-          for (auto l = gemm_shape.M; l > 0; --l) {
-            MlasEltwiseAdd<float>(MxN, biases.data(), MxN, gemm_shape.N);
-            MxN += gemm_shape.N;
-          }
-        }
-      }
-    }
   }
 #endif
   return Status::OK();
