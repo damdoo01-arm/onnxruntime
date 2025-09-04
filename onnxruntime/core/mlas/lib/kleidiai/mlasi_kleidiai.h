@@ -181,4 +181,5 @@ MlasGemmBatchConvInteger(
     const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
     const size_t BatchN,
     MLAS_THREADPOOL* ThreadPool);
+
 }

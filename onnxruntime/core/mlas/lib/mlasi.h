@@ -1298,8 +1298,6 @@ struct MLAS_PLATFORM {
     MLAS_SGEMM_PACK_B_SIZE_OVERRIDE* MlasSGemmPackBSizeOverride = nullptr;
     MLAS_SGEMM_PACK_B_OVERRIDE* MlasSGemmPackBOverride = nullptr;
     MLAS_QGEMM_BATCH_OVERRIDE* MlasQGemmBatchOverride = nullptr;
-    MLAS_QGEMM_PACK_B_SIZE_OVERRIDE* MlasQGemmPackBSizeOverride = nullptr;
-    MLAS_QGEMM_PACK_B_OVERRIDE* MlasQGemmPackBOverride = nullptr;
     MLAS_CONV_PREPARE_FLOAT_OVERRIDE* MlasConvPrepareOverride = nullptr;
     MLAS_CONV_FLOAT_OVERRIDE* MlasConvOverride = nullptr;
 

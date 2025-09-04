@@ -589,8 +589,6 @@ Return Value:
         this->MlasSGemmPackBSizeOverride = ArmKleidiAI::MlasGemmPackBSize;
         this->MlasSGemmPackBOverride = ArmKleidiAI::MlasGemmPackB;
         this->MlasQGemmBatchOverride = ArmKleidiAI::MlasGemmBatch;
-        this->MlasQGemmPackBSizeOverride = ArmKleidiAI::MlasGemmPackBSize;
-        this->MlasQGemmPackBOverride = ArmKleidiAI::MlasGemmPackB;
         this->MlasConvPrepareOverride = ArmKleidiAI::MlasConvPrepare;
         this->MlasConvOverride = ArmKleidiAI::MlasConv;
     }

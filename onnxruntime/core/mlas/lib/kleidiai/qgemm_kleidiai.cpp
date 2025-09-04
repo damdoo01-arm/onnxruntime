@@ -34,17 +34,6 @@ struct KaiPackedBHeader {
 };
 #pragma pack(pop)
 
-static constexpr uint32_t kKaiPackedBMagic = 0x3149414B;
-
-inline bool IsKaiPackedB(const void* p, size_t K, size_t N, const std::byte** payload_out) {
-  if (!p) return false;
-  const auto* h = reinterpret_cast<const KaiPackedBHeader*>(p);
-  if (h->magic != kKaiPackedBMagic) return false;
-  if (h->K != K || h->N != N) return false;
-  *payload_out = reinterpret_cast<const std::byte*>(h + 1);
-  return true;
-}
-
 
 size_t
 MLASCALL
@@ -150,51 +139,6 @@ ArmKleidiAI::MlasDynamicQGemmBatch(
 }
 
 
-size_t
-MLASCALL
-ArmKleidiAI::MlasGemmPackBSize(
-    size_t N,
-    size_t K,
-    bool /*AIsSigned*/,
-    bool /*BIsSigned*/
-) {
-    const size_t payload = kai_get_dst_size_reorder_transpose(K, N);
-    return sizeof(KaiPackedBHeader) + payload;
-}
-
-bool
-MLASCALL
-ArmKleidiAI::MlasGemmPackB(
-    size_t N,
-    size_t K,
-    const uint8_t* B,
-    size_t ldb,         // elements
-    bool /*AIsSigned*/,
-    bool /*BIsSigned*/,
-    void* PackedB
-) {
-    // 1) Write header
-    auto* hdr = reinterpret_cast<KaiPackedBHeader*>(PackedB);
-    hdr->magic = kKaiPackedBMagic;
-    hdr->K = static_cast<uint32_t>(K);
-    hdr->N = static_cast<uint32_t>(N);
-    hdr->flags = 0;
-
-    // 2) Pack payload right after header
-    auto* dst_payload = reinterpret_cast<std::byte*>(hdr + 1);
-
-    const kai_reorder_shape_t shape{ .height = K, .width = N };
-    const kai_reorder_buffers_t bufs{
-        .src = B,
-        .src_stride = ldb * sizeof(uint8_t),   // convert elements→bytes
-        .dst = dst_payload,
-    };
-    const kai_reorder_params_t prm{ .flags = 0 };
-
-    kai_run_reorder_transpose(&shape, &bufs, &prm);
-    return true;
-}
-
 bool
 MLASCALL
 ArmKleidiAI::MlasGemmBatch(
@@ -203,123 +147,155 @@ ArmKleidiAI::MlasGemmBatch(
     const size_t BatchN,
     MLAS_THREADPOOL* /*ThreadPool*/
 ) {
-  const size_t M = Shape.M, N = Shape.N, K = Shape.K;
+  const size_t m = Shape.M, n = Shape.N, k = Shape.K;
+
+  // Use KAI only for the integer->float path we implement here.
+  for (size_t i = 0; i < BatchN; ++i) {
+    const auto& p = DataParams[i];
+    if (p.BIsPacked)           return false;
+    if (p.PerColumnZeroPoints) return false; // Unsupported in the KAI kernel
+    if (p.PerColumnScale) return false; // Unsupported in the KAI kernel
+    if (p.Scale == nullptr)    return false; // integer output path -> MLAS
+  }
 
   for (size_t i = 0; i < BatchN; ++i) {
     const auto& p = DataParams[i];
 
-    // Only accept prepacked RHS in KAI format; no per-column ZP .
-    if (!p.BIsPacked || p.PerColumnZeroPoints) return false;
+    // Inputs/strides
+    const void*  lhs_qdata  = static_cast<const void*>(p.A);
+    const size_t lhs_stride = p.lda * sizeof(uint8_t);
+    const void*  rhs_qdata  = static_cast<const void*>(p.B);
+    const size_t rhs_stride = p.ldb * sizeof(uint8_t);
 
-    // Locate packed payload
-    const std::byte* rhs_reordered = nullptr;
-    if (!IsKaiPackedB(p.B, K, N, &rhs_reordered)) return false; // not ours → let MLAS handle
+    // True (signed/unsigned) zero-points as int32
+    const int32_t zpA = Shape.AIsSigned ? (int32_t)(int8_t)p.ZeroPointA : (int32_t)p.ZeroPointA;
+    const uint8_t zpB_u8 = p.ZeroPointB ? *p.ZeroPointB : 0;
+    const int32_t zpB = Shape.BIsSigned ? (int32_t)(int8_t)zpB_u8 : (int32_t)zpB_u8;
 
-    // --- LHS: reorder at runtime (A changes every call) ---
-    const size_t lhs_reordered_size = kai_get_dst_size_reorder(M, K);
+    // Output (float)
+    void*        dst          = static_cast<void*>(reinterpret_cast<float*>(p.C));
+    const size_t dst_stride_f = p.ldc * sizeof(float);
+    const float* scale        = p.PerColumnScale ? (p.Scale + p.RightScaleOffset) : p.Scale;
+
+    static thread_local std::vector<float> zero_bias;
+
+    // Reorder A (m x k)
+    const size_t lhs_reordered_size = kai_get_dst_size_reorder(m, k);
     std::vector<std::byte> lhs_reordered(lhs_reordered_size);
     {
-      const kai_reorder_shape_t s{ .height = M, .width = K };
-      const kai_reorder_buffers_t b{ .src = p.A, .src_stride = p.lda, .dst = lhs_reordered.data() };
+      const kai_reorder_shape_t  s{ .height = m, .width = k };
+      const kai_reorder_buffers_t b{ .src = lhs_qdata, .src_stride = lhs_stride, .dst = lhs_reordered.data() };
       const kai_reorder_params_t prm{ .flags = 0 };
       kai_run_reorder(&s, &b, &prm);
     }
 
-    // --- Accumulator row/col biases on KAI layouts ---
-    const size_t acc_row_bias_size = kai_get_dst_size_reduce_add_scale_reordered(M);
-    std::vector<std::byte> acc_row_bias(acc_row_bias_size);
+    // Reorder/transpose B (k x n)
+    const size_t rhs_reordered_size = kai_get_dst_size_reorder_transpose(k, n);
+    std::vector<std::byte> rhs_reordered(rhs_reordered_size);
     {
-      const kai_reduce_shape_t s{ .height = M, .width = K };
-      const int32_t dst_scale = -static_cast<int32_t>(*p.ZeroPointB);
-      const int32_t dst_bias  = 0;
+      const kai_reorder_shape_t  s{ .height = k, .width = n };
+      const kai_reorder_buffers_t b{ .src = rhs_qdata, .src_stride = rhs_stride, .dst = rhs_reordered.data() };
+      const kai_reorder_params_t prm{ .flags = 0 };
+      kai_run_reorder_transpose(&s, &b, &prm);
+    }
+
+    // Map signed tensors into u8 by adding 128 in-place (so later sums are ΣA' / ΣB')
+    auto add128_inplace = [](std::byte* buf, size_t bytes) {
+      auto* p8 = reinterpret_cast<uint8_t*>(buf);
+      for (size_t t = 0; t < bytes; ++t) p8[t] = static_cast<uint8_t>(p8[t] + 128);
+    };
+    if (Shape.AIsSigned) add128_inplace(lhs_reordered.data(), lhs_reordered.size());
+    if (Shape.BIsSigned) add128_inplace(rhs_reordered.data(), rhs_reordered.size());
+
+    // --- compute row/col sums in u8 domain (after +128 fixups) ---
+    const size_t sum_row_size = kai_get_dst_size_reduce_add_scale_reordered(m);
+    std::vector<std::byte> sum_row(sum_row_size);
+    {
+      const kai_reduce_shape_t s{ .height = m, .width = k };
+      const int32_t one = 1, zero = 0;
       const kai_reduce_buffers_t b{
         .src = lhs_reordered.data(), .src_stride = 0,
-        .dst = acc_row_bias.data(),  .dst_stride = 0,
-        .dst_scale = &dst_scale,     .dst_scale_stride = 0,
-        .dst_bias  = &dst_bias,      .dst_bias_stride  = 0
+        .dst = sum_row.data(),       .dst_stride = 0,
+        .dst_scale = &one,           .dst_scale_stride = 0,
+        .dst_bias  = &zero,          .dst_bias_stride  = 0
       };
       const kai_reduce_params_t prm{ .flags = 0 };
       kai_run_reduce_add_scale_reordered(&s, &b, &prm);
     }
 
-    const size_t acc_col_bias_size = kai_get_dst_size_reduce_add_scale_reordered(N);
-    std::vector<std::byte> acc_col_bias(acc_col_bias_size);
+    const size_t sum_col_size = kai_get_dst_size_reduce_add_scale_reordered(n);
+    std::vector<std::byte> sum_col(sum_col_size);
     {
-      const kai_reduce_shape_t s{ .height = N, .width = K };
-      const int32_t dst_scale = -static_cast<int32_t>(p.ZeroPointA);
-      const int32_t dst_bias  = -static_cast<int32_t>(K) * static_cast<int32_t>(*p.ZeroPointB);
+      const kai_reduce_shape_t s{ .height = n, .width = k };
+      const int32_t one = 1, zero = 0;
       const kai_reduce_buffers_t b{
-        .src = rhs_reordered,        .src_stride = 0,
-        .dst = acc_col_bias.data(),  .dst_stride = 0,
-        .dst_scale = &dst_scale,     .dst_scale_stride = 0,
-        .dst_bias  = &dst_bias,      .dst_bias_stride  = 0
+        .src = rhs_reordered.data(), .src_stride = 0,
+        .dst = sum_col.data(),       .dst_stride = 0,
+        .dst_scale = &one,           .dst_scale_stride = 0,
+        .dst_bias  = &zero,          .dst_bias_stride  = 0
       };
       const kai_reduce_params_t prm{ .flags = 0 };
       kai_run_reduce_add_scale_reordered(&s, &b, &prm);
     }
 
-    // --- GEMM: choose int→float or int32 path based on p.Scale ---
-    const bool to_float = (p.Scale != nullptr);
+    // --- pre-scale INT32 corrections (what the kernel expects in acc_*_bias) ---
+    const int32_t zpA_u = zpA + (Shape.AIsSigned ? 128 : 0);
+    const int32_t zpB_u = zpB + (Shape.BIsSigned ? 128 : 0);
 
-    if (to_float) {
-      const size_t lhs_ps = kai_get_lhs_packed_stride_matmul_integer_to_float(K);
-      const size_t rhs_ps = kai_get_rhs_packed_stride_matmul_integer_to_float(K);
-
-      static const float kOne = 1.0f;
-      const float* scale = p.Scale ? (p.PerColumnScale ? (p.Scale + p.RightScaleOffset) : p.Scale)
-                             : &kOne;
-
-      static const float kNegInf = -INFINITY;
-      static const float kPosInf =  INFINITY;
-      const float* fmin = p.ClampMin ? p.ClampMin : &kNegInf;
-      const float* fmax = p.ClampMax ? p.ClampMax : &kPosInf;
-      static thread_local std::vector<float> tls_zero_bias;
-      const float* col_bias_f32 = p.Bias;
-
-      if (!col_bias_f32) {
-        // make sure we have at least N zeros for this thread
-        if (tls_zero_bias.size() < N) tls_zero_bias.assign(N, 0.0f);
-        col_bias_f32 = tls_zero_bias.data();
+    std::vector<int32_t> row_bias_i32(m);
+    {
+      const int32_t* sr = reinterpret_cast<const int32_t*>(sum_row.data());
+      for (size_t i = 0; i < m; ++i) {
+        // (-ZPB′) * sum_row(A′)
+        row_bias_i32[i] = -zpB_u * sr[i];
       }
-
-      const kai_matmul_shape_t s_mm{ .m = M, .n = N, .k = K };
-      const kai_matmul_buffers_t b_mm{
-        .lhs = lhs_reordered.data(),
-        .lhs_stride = lhs_ps,
-        .rhs = rhs_reordered,
-        .rhs_stride = rhs_ps,
-        .acc_row_bias = acc_row_bias.data(),
-        .acc_col_bias = acc_col_bias.data(),
-        .scale = scale,
-        .col_bias = col_bias_f32,
-        .dst = static_cast<void*>(reinterpret_cast<float*>(p.C)),
-        .dst_stride = p.ldc * sizeof(float),
-        .acc = nullptr,
-        .min = fmin, .max = fmax,
-      };
-      const kai_matmul_params_t prm_mm{ .flags = 0 };
-      kai_run_matmul_integer_to_float(&s_mm, &b_mm, &prm_mm);
-    } else {
-      const size_t lhs_ps = kai_get_lhs_packed_stride_matmul_integer(K);
-      const size_t rhs_ps = kai_get_rhs_packed_stride_matmul_integer(K);
-
-      const kai_matmul_shape_t s_mm{ .m = M, .n = N, .k = K };
-      const kai_matmul_buffers_t b_mm{
-        .lhs = lhs_reordered.data(), .lhs_stride = lhs_ps,
-        .rhs = rhs_reordered,        .rhs_stride = rhs_ps,
-        .acc_row_bias = acc_row_bias.data(),
-        .acc_col_bias = acc_col_bias.data(),
-        .scale = nullptr,
-        .col_bias = nullptr,
-        .dst = static_cast<void*>(p.C),
-        .dst_stride = p.ldc * sizeof(int32_t),
-        .acc = nullptr,
-        .min = nullptr, .max = nullptr,
-      };
-      const kai_matmul_params_t prm_mm{ .flags = 0 };
-      kai_run_matmul_integer(&s_mm, &b_mm, &prm_mm);
     }
-  }
 
+    std::vector<int32_t> col_bias_i32(n);
+    {
+      const int32_t* sc = reinterpret_cast<const int32_t*>(sum_col.data());
+      const int64_t k_const = (int64_t)k * (int64_t)zpA_u * (int64_t)zpB_u;
+      for (size_t j = 0; j < n; ++j) {
+        // (-ZPA′) * sum_col(B′) + K * ZPA′ * ZPB′
+        const int64_t t = (int64_t)(-zpA_u) * (int64_t)sc[j] + k_const;
+        col_bias_i32[j] = (int32_t)t;
+      }
+    }
+
+    // --- scalar scale; pass model bias (post-scale float) via col_bias ---
+    const float scale_scalar = *scale;          // per-tensor only (you gated per-column)
+    static thread_local std::vector<float> zero_bias_f;
+    if (!p.Bias) { zero_bias_f.assign(n, 0.0f); }
+
+    const size_t lhs_ps = kai_get_lhs_packed_stride_matmul_integer_to_float(k);
+    const size_t rhs_ps = kai_get_rhs_packed_stride_matmul_integer_to_float(k);
+
+    float neg_inf = -std::numeric_limits<float>::infinity();
+    float pos_inf =  std::numeric_limits<float>::infinity();
+    const float* fmin = p.ClampMin ? p.ClampMin : &neg_inf;
+    const float* fmax = p.ClampMax ? p.ClampMax : &pos_inf;
+
+    const kai_matmul_shape_t  s_mm{ .m = m, .n = n, .k = k };
+    const kai_matmul_buffers_t b_mm{
+      .lhs = lhs_reordered.data(), .lhs_stride = lhs_ps,
+      .rhs = rhs_reordered.data(), .rhs_stride = rhs_ps,
+
+      // PRE-SCALE int32 corrections:
+      .acc_row_bias = row_bias_i32.data(),
+      .acc_col_bias = col_bias_i32.data(),
+
+      // POST-SCALE:
+      .scale = &scale_scalar,
+      .col_bias = p.Bias ? p.Bias : zero_bias_f.data(),  // add model bias after scaling
+
+      .dst = dst,
+      .dst_stride = dst_stride_f,
+      .acc = nullptr,
+      .min = fmin,
+      .max = fmax,
+    };
+    const kai_matmul_params_t prm_mm{ .flags = 0 };
+    kai_run_matmul_integer_to_float(&s_mm, &b_mm, &prm_mm);
+  }
   return true;
 }
