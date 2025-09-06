@@ -138,7 +138,6 @@ ArmKleidiAI::MlasDynamicQGemmBatch(
     }
 }
 
-
 bool
 MLASCALL
 ArmKleidiAI::MlasGemmBatch(
