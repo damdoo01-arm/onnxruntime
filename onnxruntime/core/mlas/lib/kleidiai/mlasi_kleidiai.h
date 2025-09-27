@@ -31,6 +31,15 @@ MlasGemmPackBSize(
     size_t K
     );
 
+size_t
+MLASCALL
+MlasGemmPackBSize(
+    size_t N,
+    size_t K,
+    bool AIsSigned,
+    bool BIsSigned
+    );
+
 bool
 MLASCALL
 MlasGemmPackB(
@@ -40,6 +49,18 @@ MlasGemmPackB(
     size_t K,
     const float* B,
     size_t ldb,
+    void* PackedB
+    );
+
+bool
+MLASCALL
+MlasGemmPackB(
+    size_t N,
+    size_t K,
+    const uint8_t* B,
+    size_t ldb,
+    bool AIsSigned,
+    bool BIsSigned,
     void* PackedB
     );
 
@@ -56,12 +77,21 @@ MlasGemmBatch(
     MLAS_THREADPOOL* ThreadPool
     );
 
+bool
+MLASCALL
+MlasGemmBatch(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL*
+    );
+
 size_t
 MLASCALL
 MlasDynamicQgemmPackBSize(
     size_t N,
     size_t K
-);
+    );
 
 void
 MLASCALL
@@ -114,4 +144,15 @@ MlasConv(
     float* Output,
     MLAS_THREADPOOL* ThreadPool
     );
+
+// CONV INTEGER / QGEMM
+
+bool
+MLASCALL
+MlasGemmBatchConvInteger(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL* ThreadPool);
+
 }

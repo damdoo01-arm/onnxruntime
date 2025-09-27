@@ -5,6 +5,7 @@
 #include "core/common/narrow.h"
 #include "core/common/safeint.h"
 #include "core/mlas/inc/mlas.h"
+#include "core/providers/common.h"
 #include "core/providers/cpu/math/element_wise_ops.h"
 #include "core/providers/cpu/math/matmul_helper.h"
 #include "core/providers/cpu/quantization/matmul_integer_base.h"
@@ -151,6 +152,19 @@ Status MatMulIntegerToFloatBase::ComputeCommon(OpKernelContext* ctx,
     params.PerColumnZeroPoints = is_b_zp_per_column;
     params.C = reinterpret_cast<int32_t*>(y_data + helper.OutputOffsets()[gemm_idx]);
     params.ldc = gemm_shape.N;
+
+    if (is_b_scale_per_column) {
+      params.PerColumnScale = true;
+      params.Scale = multipliers_per_column.data();
+      params.RightScaleOffset = helper.RightScaleOffsets()[gemm_idx];
+    } else {
+      params.PerColumnScale = false;
+      params.Scale = &multiplier_per_tensor;
+      params.RightScaleOffset = 0;
+    }
+    params.Bias = bias_data;
+    params.ClampMin = nullptr;
+    params.ClampMax = nullptr;
   }
 
   MlasGemmBatch(gemm_shape, gemm_data_vec.data(), num_gemms, ctx->GetOperatorThreadPool());
@@ -178,23 +192,23 @@ class DynamicQuantizeMatMul final : public MatMulIntegerToFloatBase {
         b_zp_constant_tensor = &b_zp->Get<Tensor>();
       }
 
-      // MlasDynamicQgemm requires symmetric quantization for B, so the B zero point value should either be all zeros
-      // or not provided.
+      // MlasDynamicQgemm fast path requires symmetric per-tensor B ZP (typically 0 for s8).
       if (b_zp_constant_tensor != nullptr) {
-        // B zero point is constant. Check if it is all zeros.
+        // B zero point is constant. Check if it is all zeros (symmetric int8 case).
         assert(b_zp_constant_tensor->IsDataType<uint8_t>() || b_zp_constant_tensor->IsDataType<int8_t>());
         const auto* zp_bytes = static_cast<const std::byte*>(b_zp_constant_tensor->DataRaw());
         const size_t zp_size_in_bytes = b_zp_constant_tensor->SizeInBytes();
-        b_quantization_might_be_asymmetric = std::any_of(zp_bytes, zp_bytes + zp_size_in_bytes,
-                                                         [](std::byte v) { return v != std::byte{0}; });
+        b_quantization_might_be_asymmetric = std::any_of(
+            zp_bytes, zp_bytes + zp_size_in_bytes,
+            [](std::byte v) { return v != std::byte{0}; });
       } else {
-        // B zero point input is not constant. If it exists, we can't assume symmetric quantization.
+        // Not constant: if the input exists we must assume it may be asymmetric.
         const auto input_defs = Info().node().InputDefs();
         const bool b_zp_input_exists = input_defs.size() > IN_B_ZERO_POINT && input_defs[IN_B_ZERO_POINT]->Exists();
         b_quantization_might_be_asymmetric = b_zp_input_exists;
       }
 
-      // MlasDynamicQgemm requires scale data to be available at packing stage
+      // MlasDynamicQgemm requires scale data available at pack time (for fused path).
       const Tensor* b_scale_tensor = nullptr;
       const bool b_scale_available = Info().TryGetConstantInput(IN_B_SCALE, &b_scale_tensor);
 
@@ -213,8 +227,7 @@ class DynamicQuantizeMatMul final : public MatMulIntegerToFloatBase {
         }
       }
 
-      // Currently, MlasDynamicQGemmBatch() and associated functions require SME or else they are no-ops.
-      // We check that here too before attempting to use them.
+      // SME required.
       if (!CPUIDInfo::GetCPUIDInfo().HasArm_SME()) {
         can_use_dynamic_quant_mlas_ = false;
       }
@@ -229,23 +242,26 @@ class DynamicQuantizeMatMul final : public MatMulIntegerToFloatBase {
 
       // Can we use the mlas dynamic Q gemm interface supported with float output ?
       if (!can_use_dynamic_quant_mlas_) {
-        // default to piece wise mlas interface with separate int matmul, quantize and float conversion
         return MatMulIntegerToFloatBase::PrePack(tensor, input_idx, alloc, is_packed, prepacked_weights);
       }
+
+      // ----------- Fused MLAS DynamicQGemm pack path (unchanged) -----------
       is_packed = false;
 
-      // Default to all zeros for bias
+      // Optional bias
       const Tensor* bias_tensor{nullptr};
       const OrtValue* bias;
       if (Info().TryGetConstantInput(IN_BIAS, &bias)) {
         bias_tensor = &bias->Get<Tensor>();
         dynamic_quant_mlas_bias_data_was_packed_ = true;
       }
+
+      b_shape_ = tensor.Shape();
+
       size_t K = static_cast<size_t>(b_shape_[0]);
       size_t N = static_cast<size_t>(b_shape_[1]);
 
       const auto* b_data = static_cast<const uint8_t*>(tensor.DataRaw());
-
       std::optional<Tensor> b_trans_buffer;
       if (IsBTransposed()) {
         std::swap(K, N);
@@ -258,28 +274,22 @@ class DynamicQuantizeMatMul final : public MatMulIntegerToFloatBase {
       }
 
       packed_b_ = IAllocator::MakeUniquePtr<void>(alloc, packed_b_size, true);
-      // Initialize memory to 0 as there could be some padding associated with pre-packed
-      // buffer memory and we do not want it uninitialized and generate different hashes
-      // if and when we try to cache this pre-packed buffer for sharing between sessions.
       memset(packed_b_.get(), 0, packed_b_size);
 
-      const auto scales = static_cast<size_t>(b_scale_tensor->Shape().Size()) == N ? std::vector<float>(&b_scale_tensor->Data<float>()[0],
-                                                                                                        &b_scale_tensor->Data<float>()[N])
-                                                                                   :
-                                                                                   // Broadcast matrix scale to all channels
-                              std::vector<float>(N, b_scale_tensor->Data<float>()[0]);
+      const auto scales = static_cast<size_t>(b_scale_tensor->Shape().Size()) == N
+                              ? std::vector<float>(&b_scale_tensor->Data<float>()[0],
+                                                   &b_scale_tensor->Data<float>()[N])
+                              : std::vector<float>(N, b_scale_tensor->Data<float>()[0]);
 
-      const auto biases = bias_tensor != nullptr ? std::vector<float>(&bias_tensor->Data<float>()[0],
-                                                                      &bias_tensor->Data<float>()[N])
-                                                 :
-                                                 // Broadcast zero to all channels - no bias data is available
-                              std::vector<float>(N, 0.f);
+      const auto biases = bias_tensor != nullptr
+                              ? std::vector<float>(&bias_tensor->Data<float>()[0],
+                                                   &bias_tensor->Data<float>()[N])
+                              : std::vector<float>(N, 0.f);
 
-      MlasDynamicQgemmPackB(N, K, reinterpret_cast<const int8_t*>(b_data), scales.data(), biases.data(),
-                            packed_b_.get());
+      MlasDynamicQgemmPackB(N, K, reinterpret_cast<const int8_t*>(b_data),
+                            scales.data(), biases.data(), packed_b_.get());
 
-      bool share_prepacked_weights = (prepacked_weights != nullptr);
-      if (share_prepacked_weights) {
+      if (prepacked_weights != nullptr) {
         prepacked_weights->buffers_.push_back(std::move(packed_b_));
         prepacked_weights->buffer_sizes_.push_back(packed_b_size);
       }
@@ -312,8 +322,10 @@ class MatMulIntegerToFloat final : public MatMulIntegerToFloatBase {
  public:
   MatMulIntegerToFloat(const OpKernelInfo& info) : MatMulIntegerToFloatBase(info) {}
 
-  Status Compute(OpKernelContext* context) const override;
+  // Declare only. The body already exists later in the file.
+  Status Compute(OpKernelContext* ctx) const override;
 
+  // Inputs for MatMulIntegerToFloat (NOT the same enum as DynamicQuantizeMatMul):
   enum InputTensors : int {
     IN_A = 0,
     IN_B = 1,
@@ -327,11 +339,79 @@ class MatMulIntegerToFloat final : public MatMulIntegerToFloatBase {
  protected:
   int GetBIdx() const override { return IN_B; }
 
+#if defined(USE_KLEIDIAI) && !defined(_MSC_VER)
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                 bool& is_packed, PrePackedWeights* prepacked_weights) override;
+#endif
+
  private:
   // a scale and b scale may be switched in fusion stage because of lack of shape information.
   // Fix them up before computation.
   static void FixupScaleTensor(const Tensor*& a_scale_tensor, const Tensor*& b_scale_tensor);
 };
+
+#if defined(USE_KLEIDIAI) && !defined(_MSC_VER)
+Status MatMulIntegerToFloat::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                                     bool& is_packed, PrePackedWeights* prepacked_weights) {
+  is_packed = false;
+
+  if (input_idx != GetBIdx()) return Status::OK();
+
+  // ---- B zero-point (disallow per-column for KAI path) ----
+  const Tensor* b_zp_const = nullptr;
+  if (const OrtValue* v; Info().TryGetConstantInput(IN_B_ZERO_POINT, &v)) {
+    b_zp_const = &v->Get<Tensor>();
+  }
+
+  bool b_zp_per_column = false;
+  if (b_zp_const) {
+    // IMPORTANT: IsScalarOr1ElementVector expects a Tensor*
+    b_zp_per_column = !IsScalarOr1ElementVector(b_zp_const);
+  } else {
+    const auto& defs = Info().node().InputDefs();
+    const bool b_zp_input_exists = defs.size() > IN_B_ZERO_POINT && defs[IN_B_ZERO_POINT]->Exists();
+    b_zp_per_column = b_zp_input_exists;  // conservatively assume per-column possible
+  }
+
+  // ---- B scale: KAI path supports per-tensor only ----
+  const Tensor* b_scale_const = nullptr;
+  const bool b_scale_available = Info().TryGetConstantInput(IN_B_SCALE, &b_scale_const);
+  const bool b_scale_per_column = b_scale_available && !IsScalarOr1ElementVector(b_scale_const);
+
+  // Optional: disallow negative scales for KAI
+  bool scales_ok = true;
+  if (b_scale_available) {
+    const float* s = b_scale_const->Data<float>();
+    const size_t sz = static_cast<size_t>(b_scale_const->Shape().Size());
+    for (size_t i = 0; i < sz; ++i) {
+      if (s[i] < 0.f) {
+        scales_ok = false;
+        break;
+      }
+    }
+  }
+
+  // Shape gate (2D or 1x2D), same as your dynamic path
+  const TensorShape& b_shape = tensor.Shape();
+  const bool shape_ok = (b_shape.NumDimensions() == 2) ||
+                        (b_shape.NumDimensions() == 3 && b_shape[0] == 1);
+
+  // Require SME for your KAI path
+  const bool sme_ok = CPUIDInfo::GetCPUIDInfo().HasArm_SME();
+
+  const bool can_use_kai =
+      sme_ok && shape_ok && b_scale_available &&
+      !b_scale_per_column && !b_zp_per_column && scales_ok;
+
+  if (can_use_kai) {
+    // CRITICAL: leave B unpacked -> p.BIsPacked == false -> KleidiAI route in MlasGemmBatch
+    return Status::OK();
+  }
+
+  // Otherwise default pack (MLAS packed-B path)
+  return MatMulIntegerToFloatBase::PrePack(tensor, input_idx, alloc, is_packed, prepacked_weights);
+}
+#endif
 
 Status DynamicQuantizeMatMul::Compute(OpKernelContext* ctx) const {
   // Can this operation be offloaded to a MLAS specific dynamic quantization matmul ?
@@ -392,7 +472,7 @@ Status DynamicQuantizeMatMul::Compute(OpKernelContext* ctx) const {
     if (y->Shape().Size() == 0)
       return Status::OK();
 
-    const float* a_data = ctx->Input<Tensor>(IN_A)->Data<float>();
+    auto a_data = ctx->Input<Tensor>(IN_A)->Data<float>();
     auto* y_data = y->MutableData<float>();
 
     // batch gemm

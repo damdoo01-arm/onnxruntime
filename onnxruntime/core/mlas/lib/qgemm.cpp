@@ -139,6 +139,11 @@ MlasGemmBatch(
     const size_t BatchN,
     MLAS_THREADPOOL* ThreadPool)
 {
+    if(GetMlasPlatform().MlasQGemmBatchOverride != nullptr &&
+        GetMlasPlatform().MlasQGemmBatchOverride(Shape, DataParams, BatchN, ThreadPool)){
+        return;
+    }
+
     const size_t M = Shape.M;
     const size_t N = Shape.N;
     const size_t K = Shape.K;
@@ -379,10 +384,6 @@ Return Value:
 
 --*/
 {
-    //
-    // Retrieve the packing parameters.
-    //
-
     const auto* GemmQuantDispatch = MlasGemmQuantGetDispatch(AIsSigned, BIsSigned);
 
     size_t PackedK = GemmQuantDispatch->PackedK;

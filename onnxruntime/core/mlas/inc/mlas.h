@@ -600,6 +600,12 @@ struct MLAS_GEMM_QUANT_DATA_PARAMS {
     int32_t* C = nullptr;
     size_t ldc = 0;
     const MLAS_QGEMM_OUTPUT_PROCESSOR* OutputProcessor = nullptr;
+    const float* Scale = nullptr;
+    bool PerColumnScale = false;
+    size_t RightScaleOffset = 0;
+    const float* Bias = nullptr;
+    const float* ClampMin = nullptr;
+    const float* ClampMax = nullptr;
 };
 
 /**

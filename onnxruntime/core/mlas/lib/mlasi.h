@@ -806,7 +806,6 @@ bool
     float* Output,
     MLAS_THREADPOOL* ThreadPool
     );
-// TODO: Investigate if overridden typedefs can be removed
 typedef
 void
 (MLASCALL MLAS_CONV_PREPARE_FLOAT_FN)(
@@ -848,7 +847,7 @@ bool
     MLAS_THREADPOOL* ThreadPool
     );
 
-typedef void (MLASCALL MLAS_GEMM_BATCH)(
+typedef bool (MLASCALL MLAS_SGEMM_BATCH_OVERRIDE)(
     CBLAS_TRANSPOSE TransA,
     CBLAS_TRANSPOSE TransB,
     size_t M,
@@ -858,29 +857,13 @@ typedef void (MLASCALL MLAS_GEMM_BATCH)(
     size_t BatchSize,
     MLAS_THREADPOOL* ThreadPool);
 
-typedef bool (MLASCALL MLAS_GEMM_BATCH_OVERRIDE)(
-    CBLAS_TRANSPOSE TransA,
-    CBLAS_TRANSPOSE TransB,
-    size_t M,
-    size_t N,
-    size_t K,
-    const MLAS_SGEMM_DATA_PARAMS* Data,
-    size_t BatchSize,
-    MLAS_THREADPOOL* ThreadPool);
-
-typedef size_t (MLASCALL MLAS_GEMM_PACK_B_SIZE)(
+typedef size_t (MLASCALL MLAS_SGEMM_PACK_B_SIZE_OVERRIDE)(
     CBLAS_TRANSPOSE TransA,
     CBLAS_TRANSPOSE TransB,
     size_t N,
     size_t K);
 
-typedef size_t (MLASCALL MLAS_GEMM_PACK_B_SIZE_OVERRIDE)(
-    CBLAS_TRANSPOSE TransA,
-    CBLAS_TRANSPOSE TransB,
-    size_t N,
-    size_t K);
-
-typedef void (MLASCALL MLAS_GEMM_PACK_B_KERNEL)(
+typedef bool (MLASCALL MLAS_SGEMM_PACK_B_OVERRIDE)(
     CBLAS_TRANSPOSE TransA,
     CBLAS_TRANSPOSE TransB,
     size_t N,
@@ -889,13 +872,26 @@ typedef void (MLASCALL MLAS_GEMM_PACK_B_KERNEL)(
     size_t ldb,
     void* PackedB);
 
-typedef bool (MLASCALL MLAS_GEMM_PACK_B_KERNEL_OVERRIDE)(
-    CBLAS_TRANSPOSE TransA,
-    CBLAS_TRANSPOSE TransB,
+typedef bool (MLASCALL MLAS_QGEMM_BATCH_OVERRIDE)(
+    const MLAS_GEMM_QUANT_SHAPE_PARAMS& Shape,
+    const MLAS_GEMM_QUANT_DATA_PARAMS* DataParams,
+    const size_t BatchN,
+    MLAS_THREADPOOL* ThreadPool
+);
+
+typedef size_t (MLASCALL MLAS_QGEMM_PACK_B_SIZE_OVERRIDE)(
     size_t N,
     size_t K,
-    const float* B,
+    bool AIsSigned,
+    bool BIsSigned);
+
+typedef bool (MLASCALL MLAS_QGEMM_PACK_B_OVERRIDE)(
+    size_t N,
+    size_t K,
+    const uint8_t* B,
     size_t ldb,
+    bool AIsSigned,
+    bool BIsSigned,
     void* PackedB);
 
 extern "C" {
@@ -1313,9 +1309,10 @@ struct MLAS_PLATFORM {
     bool ArmNeonIsQuantActivationsUnsigned = false;
 
     // Mlas overrides initialisation
-    MLAS_GEMM_BATCH_OVERRIDE* MlasGemmBatchOverride = nullptr;
-    MLAS_GEMM_PACK_B_SIZE_OVERRIDE* MlasGemmPackBSizeOverride = nullptr;
-    MLAS_GEMM_PACK_B_KERNEL_OVERRIDE* MlasGemmPackBOverride = nullptr;
+    MLAS_SGEMM_BATCH_OVERRIDE* MlasSGemmBatchOverride = nullptr;
+    MLAS_SGEMM_PACK_B_SIZE_OVERRIDE* MlasSGemmPackBSizeOverride = nullptr;
+    MLAS_SGEMM_PACK_B_OVERRIDE* MlasSGemmPackBOverride = nullptr;
+    MLAS_QGEMM_BATCH_OVERRIDE* MlasQGemmBatchOverride = nullptr;
     MLAS_CONV_PREPARE_FLOAT_OVERRIDE* MlasConvPrepareOverride = nullptr;
     MLAS_CONV_FLOAT_OVERRIDE* MlasConvOverride = nullptr;
 
